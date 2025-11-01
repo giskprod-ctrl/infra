@@ -1,0 +1,51 @@
+version: "3.9"
+
+x-defaults: &defaults
+  restart: unless-stopped
+  user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+  networks:
+    - sandbox
+
+services:
+  inetsim:
+    <<: *defaults
+    image: "${INETSIM_IMAGE:-opennic/inetsim}"
+    container_name: sandbox-inetsim
+    environment:
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./inetsim/logs:/var/log/inetsim
+      - ./inetsim/etc:/etc/inetsim
+    command: ["/usr/bin/inetsim", "--foreground", "--config", "/etc/inetsim/inetsim.conf"]
+
+  triage:
+    <<: *defaults
+    build:
+      context: .
+      dockerfile: triage.Dockerfile
+    container_name: sandbox-triage
+    environment:
+      TRIAGE_SAMPLE_DIR: "${SAMPLE_DIR:-./samples}"
+      TRIAGE_OUTPUT_DIR: "${TRIAGE_OUTPUT_DIR:-./samples}"
+    volumes:
+      - ./triage.sh:/opt/triage/triage.sh:ro
+      - ./samples:${SAMPLE_DIR:-./samples}
+      - ./analyse_adapter:/opt/triage/analyse_adapter:ro
+      - ./yara_rules:/opt/triage/yara_rules:ro
+    working_dir: /opt/triage
+    entrypoint: ["/bin/bash", "-lc", "tail -f /dev/null"]
+
+  suricata:
+    <<: *defaults
+    image: "${SURICATA_IMAGE:-opnsense/suricata:latest}"
+    container_name: sandbox-suricata
+    profiles: [suricata]
+    command: ["suricata", "-i", "eth0", "-v"]
+    volumes:
+      - ./suricata/etc:/etc/suricata
+      - ./suricata/logs:/var/log/suricata
+
+networks:
+  sandbox:
+    external: true
+    name: "${BRIDGE_NAME:-br-sandbox}"

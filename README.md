@@ -1,2 +1,199 @@
-# infra
-infra test qualif
+# Windows Binary Analysis Sandbox
+
+This repository contains an end-to-end infrastructure to triage, execute, and
+report on Windows binaries (`.exe`/`.msi`) in an isolated environment. The
+stack is designed for analysts who want a reproducible and tweakable setup that
+runs locally without jeopardising the host system.
+
+## Components
+
+| Component | Purpose |
+|-----------|---------|
+| `docker-compose.yml` | Starts the triage container (Wine + pe-sieve + rizin), an INetSim service for fake Internet responses, and an optional Suricata sensor.
+| `triage.sh` | Performs rapid static/dynamic triage inside the triage container and emits JSON reports.
+| `analyse_adapter/` | Python wrapper for integrating `analysisSimba.py` outputs into a standard JSON structure.
+| `orchestrator.sh` | Manages virtual machine cloning, execution, evidence collection, and final report generation.
+| `autorun.ps1` | PowerShell automation dropped inside the Windows gold image to execute samples and collect in-guest artefacts.
+| `deploy_test_env.sh` | Host bootstrap script that validates prerequisites and prepares the isolated bridge network.
+| `yara_rules/` | Baseline YARA rules for packers, injection primitives, and common droppers.
+| `final-report.template.json` | Template describing the expected report schema.
+| `final-report.example.json` | Minimal example output.
+
+## Prerequisites
+
+* Linux host with KVM support and libvirt (tested on Ubuntu 22.04).
+* Windows 10/11 gold image (`windows10-base.qcow2`) with:
+  * `qemu-guest-agent` installed and running.
+  * WinRM enabled (HTTP within the isolated bridge only).
+  * `autorun.ps1` placed in `C:\autorun\autorun.ps1`.
+  * Sysinternals Procmon and ProcDump installed (paths configurable in the script).
+  * `C:\Sandbox\Samples` directory created (or adjust `SMB_UPLOAD_DIR`).
+  * Optional: Sysmon installed and logging to `Microsoft-Windows-Sysmon/Operational`.
+* Docker Engine and Docker Compose v2.
+* Ability to create an isolated Linux bridge (no uplinks!) for the sandbox.
+
+> **Never expose the analysis network to the Internet.** Keep the bridge
+> air-gapped; only INetSim, optional Suricata, and the Windows VM should attach
+> to it.
+
+## Quick Start
+
+1. **Prepare the host**
+   ```bash
+   ./deploy_test_env.sh --bridge br-sandbox
+   ```
+   This validates dependencies, ensures KVM is available, creates the `br-sandbox`
+   bridge if required, and prints a hardening checklist. Add `--dry-run` to review
+   actions without executing them.
+
+2. **Bring up supportive services**
+   ```bash
+   docker-compose up -d
+   ```
+   This starts INetSim (`sandbox-inetsim`) and the triage container
+   (`sandbox-triage`). The triage container runs as a non-root user and mounts
+   `./samples` as its working directory.
+
+3. **Run triage on a sample**
+   ```bash
+   docker compose exec sandbox-triage ./triage.sh --file samples/test-safe.exe
+   ```
+   Output is saved as `samples/test-safe.exe.triage.json`. Review the JSON to
+   confirm hashes, entropy, YARA matches, and heuristics (`suspected`).
+
+4. **Execute full dynamic analysis**
+   ```bash
+   ./orchestrator.sh --sample samples/test-safe.exe
+   ```
+   The orchestrator clones the base QCOW2, uploads the sample via SMB, triggers
+   `autorun.ps1` through WinRM, captures traffic (`tcpdump`) and artefacts, and
+   writes `/out/<timestamp>/final-report.json` plus all evidence. Use
+   `--dry-run`, `--debug`, or `--keep-clone` while testing.
+
+## Configurable Variables
+
+Each script exposes configuration variables at the top. Override via environment
+variables or inline edits.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BASE_IMAGE_PATH` | `/var/lib/libvirt/images/windows10-base.qcow2` | Path to the Windows gold image. |
+| `BRIDGE_NAME` | `br-sandbox` | Isolated Linux bridge shared by VM and INetSim. |
+| `SAMPLE_DIR` | `./samples` | Local directory containing binaries to analyse. |
+| `OUTPUT_DIR` | `./out` | Directory where orchestrator stores evidence. |
+| `VM_MEM` / `VM_CPUS` | `4096` / `2` | Resources allocated to the analysis VM. |
+| `TIMEOUT_SECONDS` | `120` | Default runtime for dynamic execution. |
+| `INETSIM_IMAGE` | `opennic/inetsim` | Container image for INetSim. |
+| `TRIAGE_IMAGE` | `sandbox-triage` | Name of the triage container image. |
+| `TCPDUMP_ROTATE_SIZE_MB` / `TCPDUMP_FILES` | `50` / `3` | Packet capture rotation policy. |
+| `FORCE_NONROOT` | `1` | Refuse to run scripts as UID 0 unless `--allow-root`. |
+| `WINRM_PORT` | `5985` | WinRM endpoint inside the guest. |
+| `SMB_UPLOAD_DIR` | `Sandbox\Samples` | Destination directory inside the guest for samples. |
+| `RESULTS_DIR_GUEST` | `C:\results` | Location collected by `virt-copy-out`. |
+| `TIMEOUT_SECONDS` | `120` | Execution timeout passed to `autorun.ps1`. |
+
+Additional toggles:
+
+* `./orchestrator.sh --no-triage` – skip the triage JSON requirement.
+* `./orchestrator.sh --collect-memory` – force ProcDump collection (off by default for safety).
+* `./orchestrator.sh --keep-clone` – retain the cloned QCOW2 for debugging.
+* `./orchestrator.sh --dry-run` – print planned actions without executing.
+* `./orchestrator.sh --debug` – verbose logging for each command.
+* `triage.sh --debug` – embed diagnostic logs in the JSON output.
+
+## Workflow Summary
+
+1. Place a binary in `./samples`.
+2. Run triage via the container (`triage.sh`), examine the JSON verdict.
+3. If suspicious (or forced), execute `orchestrator.sh --sample <file>`.
+4. Inspect `/out/<timestamp>/` for:
+   * `final-report.json` – consolidated metadata, triage verdict, dynamic verdict, attachments list, report signature.
+   * `artifacts.json` – per-file hashes and sizes (pcaps, Procmon logs, memory dumps).
+   * `winrm-exec.json` – raw WinRM execution transcript.
+   * Collected guest artefacts (`autorun-summary.json`, `stdout.log`, `procmon.pml`, etc.) and rotated PCAPs.
+5. Use `analyse_adapter/adapter.py` to integrate additional tooling outputs as
+   required:
+   ```bash
+   ./analyse_adapter/adapter.py samples/test-safe.exe --output-dir out/analysis --json out/analysis/simba.json
+   ```
+
+## Preparing the Gold Image
+
+1. Install Windows updates, Sysinternals Suite (Procmon + ProcDump), and Sysmon if desired.
+2. Enable WinRM over HTTP for the sandbox network (`winrm quickconfig`).
+3. Install and verify `qemu-guest-agent` so `virsh domifaddr` works.
+4. Copy `autorun.ps1` to `C:\autorun\autorun.ps1` and allow script execution (`Set-ExecutionPolicy RemoteSigned`).
+5. Create `C:\Sandbox\Samples` and `C:\results` directories with write permissions.
+6. Configure Procmon to accept the EULA once manually.
+7. Create a Windows scheduled task or startup script if you want autorun to fire automatically; otherwise the orchestrator triggers it through WinRM.
+
+## Security Checklist
+
+- [ ] Always operate on an isolated bridge with no uplinks or NAT.
+- [ ] Run scripts as a non-root user unless a flag explicitly allows root.
+- [ ] Confirm `qemu-img create -b` clones are deleted after each run (default behaviour).
+- [ ] Review `artifacts.json` and `final-report.json` for SHA-256 values before moving artefacts.
+- [ ] Keep the gold image offline and patch it using a separate workflow.
+- [ ] Never mount the base QCOW2 read-write while analyses are running.
+- [ ] Validate INetSim logs before trusting dynamic verdicts.
+
+## Load and Stress Testing
+
+1. Launch multiple triage containers to parallelise static analysis (`docker compose up --scale sandbox-triage=3`).
+2. Stress-test VM orchestration with short benign samples and reduced timeout (e.g., `TIMEOUT_SECONDS=30`).
+3. Use synthetic binaries that trigger YARA rules to verify detection paths.
+4. Exercise network capture rotation by increasing `TCPDUMP_FILES` and running long-lived samples.
+5. Monitor host CPU/RAM while running sequential analyses to plan capacity.
+
+## Rollback Procedure
+
+1. Stop all containers:
+   ```bash
+   docker compose down
+   ```
+2. Destroy leftover VM clones:
+   ```bash
+   ls ${CLONE_WORKDIR:-/var/lib/libvirt/images} | grep sandbox-
+   ```
+   Remove manually if any remain.
+3. Flush captures and evidence by removing dated directories under `./out/` (verify hashes before deletion).
+4. Delete and recreate the Linux bridge if it was misconfigured:
+   ```bash
+   sudo ip link set br-sandbox down
+   sudo ip link del br-sandbox
+   ./deploy_test_env.sh --bridge br-sandbox
+   ```
+5. Restore the gold image from your offline backup if contamination is suspected.
+
+## Troubleshooting
+
+* **WinRM errors** – ensure the guest firewall allows WinRM on the sandbox subnet and that credentials in `orchestrator.sh` match the guest user.
+* **`virt-copy-in` fails** – the destination path must exist inside the guest filesystem. Create `C:\sandbox` in the gold image or update `SMB_UPLOAD_DIR`.
+* **tcpdump requires sudo** – run `sudo setcap ... tcpdump` as suggested by `deploy_test_env.sh`, or update `TCPDUMP_PRIV_CMD`.
+* **pywinrm missing** – install with `pip install pywinrm` on the host running `orchestrator.sh`.
+* **High entropy false-positives** – adjust the entropy threshold inside `triage.sh` or override `TRIAGE_TIMEOUT_SECONDS`.
+
+## File Layout
+
+```
+├── analyse_adapter/
+│   ├── __init__.py
+│   └── adapter.py
+├── autorun.ps1
+├── deploy_test_env.sh
+├── docker-compose.yml
+├── final-report.example.json
+├── final-report.template.json
+├── orchestrator.sh
+├── triage.Dockerfile
+├── triage.sh
+├── yara_rules/
+│   ├── droppers.yar
+│   ├── index.yar
+│   ├── injection.yar
+│   └── packers.yar
+└── ...
+```
+
+Test everything with safe samples first and iterate gradually. When in doubt,
+run scripts with `--dry-run` and inspect the commands before proceeding.

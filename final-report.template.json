@@ -1,0 +1,25 @@
+{
+  "timestamp": "<UTC ISO timestamp>",
+  "operator": "<operator name>",
+  "sample": {
+    "path": "<absolute path to sample>",
+    "name": "<file name>",
+    "sha256": "<sha256 of sample>",
+    "size": <size bytes>
+  },
+  "vm_image": {
+    "path": "<path to base qcow2>",
+    "sha256": "<sha256 of base image>"
+  },
+  "triage": { "suspected": <true|false>, "sha256": "<triage sha256>", "entropy": <float>, "yara_matches": [] },
+  "dynamic": {
+    "timeout_seconds": <int>,
+    "collect_memory": <true|false>,
+    "verdict": "<benign|suspicious|needs-review>",
+    "winrm": { "status_code": <int>, "std_out": "...", "std_err": "..." }
+  },
+  "attachments": [
+    { "path": "results/autorun-summary.json", "sha256": "<sha256>", "size": <bytes> }
+  ],
+  "report_integrity": { "algorithm": "sha256", "value": "<sha256 of canonical json>" }
+}
