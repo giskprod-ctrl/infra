@@ -5,21 +5,60 @@
     "path": "<absolute path to sample>",
     "name": "<file name>",
     "sha256": "<sha256 of sample>",
-    "size": <size bytes>
+    "size": <size bytes>,
+    "kind": "<exe|dll>"
   },
   "vm_image": {
     "path": "<path to base qcow2>",
     "sha256": "<sha256 of base image>"
   },
-  "triage": { "suspected": <true|false>, "sha256": "<triage sha256>", "entropy": <float>, "yara_matches": [] },
+  "triage": {
+    "static_analysis": {
+      "pe_metadata": {},
+      "dll_analysis": {},
+      "indicators": { "urls": [], "ipv4": [], "registry": [] }
+    },
+    "heuristics": { "score": <int>, "threshold": <int>, "reasons": [] },
+    "suspicion_breakdown": []
+  },
   "dynamic": {
     "timeout_seconds": <int>,
     "collect_memory": <true|false>,
     "verdict": "<benign|suspicious|needs-review>",
-    "winrm": { "status_code": <int>, "std_out": "...", "std_err": "..." }
+    "winrm": { "status_code": <int>, "std_out": "...", "std_err": "..." },
+    "baseline": { "pre": {}, "post": {}, "diff": {} },
+    "telemetry": {
+      "procmon": { "log": "results/procmon.pml", "csv": "results/procmon.csv" },
+      "etw": [],
+      "sysmon": { "pre": "results/sysmon-pre.evtx", "post": "results/sysmon-post.evtx" }
+    },
+    "stdout_streams": [ { "file": "results/stdout.log", "preview": "..." } ],
+    "stderr_streams": [ { "file": "results/stderr.log", "preview": "..." } ],
+    "executions": [ { "label": "exe", "completed": <true|false>, "memoryDumps": [] } ],
+    "memory_dumps": [ { "path": "results/memory-exe-final.dmp", "method": "ProcDump" } ],
+    "module_snapshots": [ { "label": "exe", "file": "results/modules-exe.json" } ],
+    "process_tree": []
   },
   "attachments": [
     { "path": "results/autorun-summary.json", "sha256": "<sha256>", "size": <bytes> }
   ],
-  "report_integrity": { "algorithm": "sha256", "value": "<sha256 of canonical json>" }
+  "correlations": {
+    "static_urls_seen_in_network": [ { "url": "http://example", "matched_host": "example" } ],
+    "dll_exports": { "suggested": [], "executed": [] }
+  },
+  "analysis_summary": {
+    "static": { "heuristics_score": <int>, "heuristics_reasons": [] },
+    "dynamic": { "execution_count": <int>, "memory_dump_count": <int> }
+  },
+  "host_commands": {
+    "log_path": "host-commands.log",
+    "total": <int>,
+    "recent": [ { "command": "qemu-img create ...", "return_code": 0 } ]
+  },
+  "report_integrity": {
+    "algorithm": "sha256",
+    "value": "<sha256 of canonical json>",
+    "generated_at": "<UTC ISO timestamp>",
+    "hmac_sha256": "<optional HMAC if REPORT_SIGNING_KEY_FILE provided>"
+  }
 }
