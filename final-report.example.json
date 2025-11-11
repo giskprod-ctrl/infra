@@ -31,6 +31,14 @@
     { "path": "autorun-summary.json", "sha256": "c157a79031e1c40f85931829bc5fc552", "size": 5120 },
     { "path": "sandbox-20240501-101200-20240501101200.pcap", "sha256": "3d3a9b7fcca9b7f023c0b1d8d53295d7", "size": 2684 }
   ],
+  "diagnostics": {
+    "log_path": "diagnostics/infrastructure.log",
+    "events_path": "diagnostics/debug-events.jsonl",
+    "runtime_state": { "run_id": "sandbox-20240501-101200" },
+    "support_summary": "diagnostics/support-summary.json",
+    "support_bundle": "support-bundle.tar.gz",
+    "generated_at": "2024-05-01T10:13:00Z"
+  },
   "report_integrity": {
     "algorithm": "sha256",
     "value": "0cc175b9c0f1b6a831c399e269772661"

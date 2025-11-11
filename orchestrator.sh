@@ -25,6 +25,8 @@ TCPDUMP_PRIV_CMD="${TCPDUMP_PRIV_CMD:-sudo -n}"
 VIRT_DRIVER="${VIRT_DRIVER:-virsh}"
 QEMU_URI="${QEMU_URI:-qemu:///system}"
 CLONE_WORKDIR="${CLONE_WORKDIR:-$(dirname "${BASE_IMAGE_PATH}")}"
+ENABLE_DEBUG_CHANNEL="${ENABLE_DEBUG_CHANNEL:-0}"
+CREATE_SUPPORT_BUNDLE="${CREATE_SUPPORT_BUNDLE:-0}"
 DRY_RUN=0
 DEBUG=0
 RUN_TRIAGE=1
@@ -37,11 +39,115 @@ REPORT_SIGNING_KEY_PASSPHRASE="${REPORT_SIGNING_KEY_PASSPHRASE:-}"
 
 declare -a COMMAND_LOG_BUFFER=()
 HOST_COMMAND_LOG=""
+DEBUG_LOG_FILE=""
+DEBUG_EVENTS_FILE=""
+RUNTIME_STATE_FILE=""
+DEBUG_CHANNEL_PIPE=""
+DEBUG_CHANNEL_PID=""
+RUN_STATUS="initializing"
 
 # ================= Utility functions =================
-log() { echo "[orchestrator] $*" >&2; }
-err() { echo "[orchestrator][error] $*" >&2; }
-die() { err "$*"; exit 1; }
+append_debug_log() {
+  local level="$1"
+  shift
+  local message="$*"
+  if [[ -n "${DEBUG_LOG_FILE}" ]]; then
+    printf '%s [%s] %s\n' "$(date --iso-8601=seconds)" "${level}" "${message}" >> "${DEBUG_LOG_FILE}"
+  fi
+}
+
+debug_event() {
+  if [[ -z "${DEBUG_EVENTS_FILE}" ]]; then
+    return
+  fi
+  local stage="$1"
+  shift
+  local message="$1"
+  shift || true
+  local details=${1:-}
+  local timestamp
+  timestamp="$(date --iso-8601=seconds)"
+  if [[ -n "${details}" ]]; then
+    jq -cn --arg ts "${timestamp}" --arg stage "${stage}" --arg message "${message}" --argjson details "${details}" '{timestamp:$ts,stage:$stage,message:$message,details:$details}' >> "${DEBUG_EVENTS_FILE}"
+  else
+    jq -cn --arg ts "${timestamp}" --arg stage "${stage}" --arg message "${message}" '{timestamp:$ts,stage:$stage,message:$message}' >> "${DEBUG_EVENTS_FILE}"
+  fi
+}
+
+update_runtime_state() {
+  if [[ -z "${RUNTIME_STATE_FILE}" ]]; then
+    return
+  fi
+  local stage="$1"
+  local status="$2"
+  local details=${3:-"{}"}
+  local timestamp
+  timestamp="$(date --iso-8601=seconds)"
+  jq -n     --arg run_id "${RUN_ID:-}"     --arg sample "${SAMPLE_PATH:-}"     --arg sample_abs "${SAMPLE_ABS:-}"     --arg sample_name "${SAMPLE_NAME:-}"     --arg clone "${CLONE_PATH:-}"     --arg vm "${VM_NAME:-}"     --arg guest "${GUEST_IP:-}"     --arg tcpdump "${TCPDUMP_PID:-}"     --arg stage_val "${stage}"     --arg status_val "${status}"     --arg ts "${timestamp}"     --arg run_status "${RUN_STATUS:-}"     --argjson details_obj "${details}"     '{
+      run_id:$run_id,
+      sample_path:$sample,
+      sample_abs:$sample_abs,
+      sample_name:$sample_name,
+      clone_path:$clone,
+      vm_name:$vm,
+      guest_ip:$guest,
+      tcpdump_pid:$tcpdump,
+      last_stage:$stage_val,
+      status:$status_val,
+      run_status:$run_status,
+      last_update:$ts,
+      details:$details_obj
+    }' > "${RUNTIME_STATE_FILE}"
+}
+
+initialize_diagnostics() {
+  if [[ -z "${RUN_DIR:-}" ]]; then
+    return
+  fi
+  local diag_dir="${RUN_DIR}/diagnostics"
+  mkdir -p "${diag_dir}"
+  DEBUG_LOG_FILE="${diag_dir}/infrastructure.log"
+  DEBUG_EVENTS_FILE="${diag_dir}/debug-events.jsonl"
+  RUNTIME_STATE_FILE="${diag_dir}/runtime-state.json"
+  : > "${DEBUG_LOG_FILE}"
+  : > "${DEBUG_EVENTS_FILE}"
+  debug_event "init" "diagnostics initialised" "$(jq -nc --arg run_id "${RUN_ID:-}" '{run_id:$run_id}')"
+  if [[ "${ENABLE_DEBUG_CHANNEL}" == "1" ]]; then
+    DEBUG_CHANNEL_PIPE="${diag_dir}/debug-console.fifo"
+    if [[ -p "${DEBUG_CHANNEL_PIPE}" ]]; then
+      rm -f "${DEBUG_CHANNEL_PIPE}"
+    fi
+    mkfifo "${DEBUG_CHANNEL_PIPE}"
+    (
+      while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        append_debug_log CONSOLE "${line}"
+        debug_event "console" "note received" "$(jq -nc --arg message "${line}" '{message:$message}')"
+      done < "${DEBUG_CHANNEL_PIPE}"
+    ) &
+    DEBUG_CHANNEL_PID=$!
+    debug_event "debug-channel" "fifo created" "$(jq -nc --arg path "${DEBUG_CHANNEL_PIPE}" '{fifo:$path}')"
+  else
+    DEBUG_CHANNEL_PIPE=""
+  fi
+  update_runtime_state "init" "ready" "$(jq -nc --arg diag "${diag_dir}" '{diagnostics_dir:$diag}')"
+}
+
+log() {
+  echo "[orchestrator] $*" >&2
+  append_debug_log INFO "$*"
+}
+
+err() {
+  echo "[orchestrator][error] $*" >&2
+  append_debug_log ERROR "$*"
+}
+
+die() {
+  RUN_STATUS="error"
+  err "$*"
+  exit 1
+}
 
 require_cmd() {
   local missing=()
@@ -69,6 +175,25 @@ command_to_string() {
   printf '%s' "${formatted}"
 }
 
+safe_capture() {
+  local file="$1"
+  shift
+  local -a cmd=("$@")
+  if [[ ${#cmd[@]} -eq 0 ]]; then
+    return
+  fi
+  local cmd_str
+  cmd_str="$(command_to_string "${cmd[@]}")"
+  (
+    set +e
+    "${cmd[@]}"
+    local rc=$?
+    if (( rc != 0 )); then
+      printf 'command failed (exit %d): %s\n' "${rc}" "${cmd_str}"
+    fi
+  ) &> "${file}" || true
+}
+
 record_command() {
   local start_ts="$1"
   local end_ts="$2"
@@ -94,6 +219,55 @@ flush_command_buffer() {
   if [[ -n "${HOST_COMMAND_LOG}" && ${#COMMAND_LOG_BUFFER[@]} -gt 0 ]]; then
     printf '%s\n' "${COMMAND_LOG_BUFFER[@]}" >> "${HOST_COMMAND_LOG}"
     COMMAND_LOG_BUFFER=()
+  fi
+}
+
+collect_support_bundle() {
+  local status="$1"
+  local reason=${2:-}
+  local should_collect=0
+  if [[ "${status}" != "success" ]]; then
+    should_collect=1
+  elif [[ "${CREATE_SUPPORT_BUNDLE}" == "1" ]]; then
+    should_collect=1
+  fi
+  if [[ ${should_collect} -eq 0 ]]; then
+    return
+  fi
+  if [[ -z "${RUN_DIR:-}" || ! -d "${RUN_DIR:-}" ]]; then
+    return
+  fi
+  local diag_dir="${RUN_DIR}/diagnostics"
+  mkdir -p "${diag_dir}"
+  local summary="${diag_dir}/support-summary.json"
+  jq -n     --arg status "${status}"     --arg reason "${reason}"     --arg ts "$(date --iso-8601=seconds)"     --arg run_status "${RUN_STATUS:-}"     '{status:$status,reason:$reason,generated_at:$ts,run_status:$run_status}' > "${summary}"
+  safe_capture "${diag_dir}/virsh-list.txt" virsh --connect "${QEMU_URI}" list --all
+  if [[ -n "${VM_NAME:-}" ]]; then
+    safe_capture "${diag_dir}/virsh-dominfo.txt" virsh --connect "${QEMU_URI}" dominfo "${VM_NAME}"
+  fi
+  safe_capture "${diag_dir}/network-bridge.txt" ip addr show "${BRIDGE_NAME}"
+  safe_capture "${diag_dir}/ip-route.txt" ip route
+  if command -v docker >/dev/null 2>&1; then
+    safe_capture "${diag_dir}/docker-ps.txt" docker ps
+    if docker compose version >/dev/null 2>&1; then
+      safe_capture "${diag_dir}/docker-compose-ps.txt" docker compose ps
+    elif command -v docker-compose >/dev/null 2>&1; then
+      safe_capture "${diag_dir}/docker-compose-ps.txt" docker-compose ps
+    fi
+  fi
+  safe_capture "${diag_dir}/df.txt" df -h
+  if command -v free >/dev/null 2>&1; then
+    safe_capture "${diag_dir}/free.txt" free -h
+  fi
+  if [[ -n "${TCPDUMP_PID:-}" ]]; then
+    safe_capture "${diag_dir}/tcpdump-status.txt" ps -p "${TCPDUMP_PID}" -o pid,ppid,cmd
+  fi
+  if [[ -n "${GUEST_IP:-}" ]]; then
+    printf '%s\n' "${GUEST_IP}" > "${diag_dir}/guest-ip.txt"
+  fi
+  debug_event "support_bundle" "collected diagnostics" "$(jq -nc --arg status "${status}" '{status:$status}')"
+  if command -v tar >/dev/null 2>&1; then
+    (cd "${RUN_DIR}" && tar -czf support-bundle.tar.gz diagnostics host-commands.log 2>/dev/null) || true
   fi
 }
 
@@ -127,6 +301,14 @@ run_cmd() {
 
 cleanup() {
   local exit_code=$?
+  local status="success"
+  if [[ $exit_code -ne 0 ]]; then
+    status="error"
+    RUN_STATUS="error"
+  else
+    RUN_STATUS="completed"
+  fi
+  debug_event "cleanup" "starting cleanup" "$(jq -nc --arg status "${status}" '{status:$status}')"
   if [[ -n "${TCPDUMP_PID:-}" ]]; then
     if kill -0 "${TCPDUMP_PID}" 2>/dev/null; then
       log "Stopping tcpdump (PID ${TCPDUMP_PID})"
@@ -149,6 +331,17 @@ cleanup() {
       rm -f "${CLONE_PATH}"
     fi
   fi
+  collect_support_bundle "${status}" "exit_code=${exit_code}"
+  if [[ -n "${DEBUG_CHANNEL_PID:-}" ]]; then
+    kill "${DEBUG_CHANNEL_PID}" >/dev/null 2>&1 || true
+    wait "${DEBUG_CHANNEL_PID}" >/dev/null 2>&1 || true
+    DEBUG_CHANNEL_PID=""
+  fi
+  if [[ -n "${DEBUG_CHANNEL_PIPE:-}" && -p "${DEBUG_CHANNEL_PIPE}" ]]; then
+    rm -f "${DEBUG_CHANNEL_PIPE}"
+    DEBUG_CHANNEL_PIPE=""
+  fi
+  update_runtime_state "cleanup" "${status}" "$(jq -nc --arg exit_code "${exit_code}" '{exit_code:($exit_code|tonumber)}')"
   if [[ $exit_code -ne 0 && ${PURGE_ARTIFACTS} -eq 1 && -d "${RUN_DIR:-}" ]]; then
     log "Purging run directory ${RUN_DIR} due to failure"
     rm -rf "${RUN_DIR}"
@@ -172,6 +365,8 @@ Options:
   --purge               Remove generated artifacts on failure (dangerous)
   --dry-run             Show commands without executing
   --debug               Verbose logging
+  --support-bundle      Always collect a diagnostics bundle (even on success)
+  --debug-channel       Enable interactive diagnostics FIFO logging
   --allow-root          Allow running as root (default refuse)
 USAGE
 }
@@ -195,6 +390,10 @@ while (("$#")); do
       DRY_RUN=1; shift ;;
     --debug)
       DEBUG=1; shift ;;
+    --support-bundle)
+      CREATE_SUPPORT_BUNDLE=1; shift ;;
+    --debug-channel)
+      ENABLE_DEBUG_CHANNEL=1; shift ;;
     --allow-root)
       ALLOW_ROOT=1; shift ;;
     -h|--help)
@@ -211,6 +410,10 @@ fi
 if [[ ! -f "${SAMPLE_PATH}" ]]; then
   die "Sample ${SAMPLE_PATH} not found"
 fi
+
+SAMPLE_ABS="$(realpath "${SAMPLE_PATH}")"
+SAMPLE_NAME="$(basename "${SAMPLE_PATH}")"
+
 
 if [[ ${FORCE_NONROOT} == "1" && ${ALLOW_ROOT} -eq 0 && $(id -u) -eq 0 ]]; then
   die "Refusing to run as root. Re-run with --allow-root if absolutely necessary."
@@ -240,8 +443,10 @@ HOST_COMMAND_LOG="${RUN_DIR}/host-commands.log"
 : > "${HOST_COMMAND_LOG}"
 flush_command_buffer
 
-SAMPLE_ABS="$(realpath "${SAMPLE_PATH}")"
-SAMPLE_NAME="$(basename "${SAMPLE_PATH}")"
+initialize_diagnostics
+RUN_STATUS="running"
+update_runtime_state "init" "prepared" "$(jq -nc --arg run_dir \"${RUN_DIR}\" '{run_dir:$run_dir}')"
+
 TRIAGE_JSON="${SAMPLE_ABS}.triage.json"
 FINAL_REPORT="${RUN_DIR}/final-report.json"
 SAMPLE_SHA="$(sha256sum "${SAMPLE_ABS}" | awk '{print $1}')"
@@ -285,12 +490,16 @@ fi
 
 log "Creating clone ${CLONE_PATH}"
 run_cmd qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE_PATH}" "${CLONE_PATH}"
+debug_event "clone" "qcow clone created" "$(jq -nc --arg clone "${CLONE_PATH}" '{clone:$clone}')"
+update_runtime_state "clone" "completed" "$(jq -nc --arg clone "${CLONE_PATH}" '{clone:$clone}')"
 
 log "Injecting sample into offline image"
 run_cmd virt-copy-in -a "${CLONE_PATH}" "${SAMPLE_ABS}" "C:\\sandbox"
+debug_event "inject" "sample staged into clone" "$(jq -nc --arg path "${SAMPLE_ABS}" '{sample:$path}')"
 
 log "Copying autorun script"
 run_cmd virt-copy-in -a "${CLONE_PATH}" autorun.ps1 "C:\\autorun"
+debug_event "inject" "autorun staged" "$(jq -nc --arg path 'C:/autorun/autorun.ps1' '{autorun:$path}')"
 
 start_vm() {
   local -a cmd=(
@@ -332,10 +541,14 @@ wait_for_ip() {
 
 log "Starting VM ${VM_NAME}"
 start_vm
+debug_event "vm" "vm start requested" "$(jq -nc --arg vm "${VM_NAME}" '{vm:$vm}')"
+update_runtime_state "vm" "starting" "$(jq -nc --arg vm "${VM_NAME}" '{vm:$vm}')"
 
 log "Waiting for guest IP via qemu-guest-agent"
 GUEST_IP="$(wait_for_ip)" || die "Failed to obtain guest IP via qemu-guest-agent. Ensure guest agent is running."
 log "Guest IP: ${GUEST_IP}"
+debug_event "vm" "guest ip acquired" "$(jq -nc --arg ip "${GUEST_IP}" '{ip:$ip}')"
+update_runtime_state "vm" "ip-acquired" "$(jq -nc --arg ip "${GUEST_IP}" '{guest_ip:$ip}')"
 
 start_tcpdump() {
   local pcap_prefix="${RUN_DIR}/${RUN_ID}"
@@ -368,6 +581,8 @@ start_tcpdump() {
   TCPDUMP_PID=$!
   record_command "${start_ts}" "${start_ts}" 0 "${cmd_str}" "background-start"
   log "tcpdump PID ${TCPDUMP_PID}"
+  debug_event "tcpdump" "packet capture started" "$(jq -nc --arg pid "${TCPDUMP_PID}" --arg iface "${BRIDGE_NAME}" '{pid:$pid,interface:$iface}')"
+  update_runtime_state "tcpdump" "running" "$(jq -nc --arg pid "${TCPDUMP_PID}" '{pid:$pid}')"
 }
 
 start_tcpdump
@@ -379,6 +594,8 @@ run_cmd smbclient "${upload_share}" "${VM_PASSWORD}" -U "${VM_USER}%${VM_PASSWOR
 remote_sample_path="${SMB_UPLOAD_DIR}\\${SAMPLE_NAME}"
 printf -v put_cmd 'put "%s" "%s"' "${SAMPLE_ABS}" "${remote_sample_path}"
 run_cmd smbclient "${upload_share}" "${VM_PASSWORD}" -U "${VM_USER}%${VM_PASSWORD}" -c "${put_cmd}"
+debug_event "upload" "sample uploaded via smb" "$(jq -nc --arg remote "${remote_sample_path}" '{remote:$remote}')"
+update_runtime_state "upload" "completed" "$(jq -nc --arg remote "${remote_sample_path}" '{remote_path:$remote}')"
 
 trigger_execution() {
   python3 - "$@" <<'PY'
@@ -438,6 +655,8 @@ if [[ $DRY_RUN -eq 1 ]]; then
   log "[dry-run] Would trigger WinRM execution"
 else
   trigger_execution "C:\\${SMB_UPLOAD_DIR}\\${SAMPLE_NAME}" "${AUTORUN_PATH}" "${VM_USER}" "${VM_PASSWORD}" "${GUEST_IP}" "${WINRM_PORT}" "${TIMEOUT_SECONDS}" "${COLLECT_MEMORY}" "${SAMPLE_KIND}" "${dll_exports_arg}" "${HEURISTICS_SCORE}" > "${RUN_DIR}/winrm-exec.json"
+  debug_event "execution" "winrm trigger issued" "$(jq -nc --arg path "${RUN_DIR}/winrm-exec.json" '{winrm_log:$path}')"
+  update_runtime_state "execution" "triggered" "$(jq -nc --arg timeout "${TIMEOUT_SECONDS}" '{timeout_seconds:($timeout|tonumber)}')"
 fi
 
 log "Sleeping for ${TIMEOUT_SECONDS}s to allow execution"
@@ -472,6 +691,8 @@ fi
 
 log "Collecting guest artifacts"
 run_cmd virt-copy-out -a "${CLONE_PATH}" "${RESULTS_DIR_GUEST}" "${RUN_DIR}"
+debug_event "collection" "guest artifacts copied" "$(jq -nc --arg path "${RESULTS_DIR_GUEST}" '{guest_dir:$path}')"
+update_runtime_state "collection" "guest-artifacts" "$(jq -nc --arg results "${RESULTS_DIR_GUEST}" '{guest_results:$results}')"
 
 log "Hashing artifacts"
 ARTIFACTS_JSON="${RUN_DIR}/artifacts.json"
@@ -494,6 +715,8 @@ for path in run_dir.rglob('*'):
         }
 print(json.dumps(artifacts, indent=2))
 PY > "${ARTIFACTS_JSON}"
+debug_event "artifacts" "artifact hashes computed" "$(jq -nc --arg path "${ARTIFACTS_JSON}" '{index:$path}')"
+update_runtime_state "artifacts" "hashed" "$(jq -nc --arg path "${ARTIFACTS_JSON}" '{artifacts_index:$path}')"
 
 log "Assembling final-report.json"
 python3 - <<'PY'
@@ -543,6 +766,26 @@ attachments = [
     {'path': rel_path, **meta}
     for rel_path, meta in sorted(artifacts_map.items())
 ]
+
+diag_dir = run_dir / 'diagnostics'
+diagnostics = {}
+if diag_dir.exists():
+    log_path = diag_dir / 'infrastructure.log'
+    if log_path.exists():
+        diagnostics['log_path'] = str(log_path.relative_to(run_dir))
+    events_path = diag_dir / 'debug-events.jsonl'
+    if events_path.exists():
+        diagnostics['events_path'] = str(events_path.relative_to(run_dir))
+    state_path = diag_dir / 'runtime-state.json'
+    if state_path.exists():
+        diagnostics['runtime_state'] = read_json(state_path)
+    summary_path = diag_dir / 'support-summary.json'
+    if summary_path.exists():
+        diagnostics['support_summary'] = str(summary_path.relative_to(run_dir))
+    support_bundle = run_dir / 'support-bundle.tar.gz'
+    if support_bundle.exists():
+        diagnostics['support_bundle'] = str(support_bundle.relative_to(run_dir))
+    diagnostics['generated_at'] = datetime.utcnow().isoformat() + 'Z'
 
 triage = read_json(triage_path) if triage_path.is_file() else {}
 
@@ -781,6 +1024,9 @@ final = {
     'analysis_summary': analysis_summary,
 }
 
+if diagnostics:
+    final['diagnostics'] = diagnostics
+
 if host_commands:
     final['host_commands'] = {
         'log_path': str(host_commands_log.relative_to(run_dir)),
@@ -809,6 +1055,9 @@ final['report_integrity'] = integrity
 
 report_path.write_text(json.dumps(final, indent=2))
 PY
+debug_event "report" "final report assembled" "$(jq -nc --arg path "${FINAL_REPORT}" '{report:$path}')"
+RUN_STATUS="finalized"
+update_runtime_state "report" "written" "$(jq -nc --arg report "${FINAL_REPORT}" '{report_path:$report}')"
 
 if [[ $KEEP_CLONE -eq 0 ]]; then
   log "Removing clone ${CLONE_PATH}"

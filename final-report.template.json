@@ -50,6 +50,14 @@
     "static": { "heuristics_score": <int>, "heuristics_reasons": [] },
     "dynamic": { "execution_count": <int>, "memory_dump_count": <int> }
   },
+  "diagnostics": {
+    "log_path": "diagnostics/infrastructure.log",
+    "events_path": "diagnostics/debug-events.jsonl",
+    "runtime_state": {},
+    "support_summary": "diagnostics/support-summary.json",
+    "support_bundle": "support-bundle.tar.gz",
+    "generated_at": "<UTC ISO timestamp>"
+  },
   "host_commands": {
     "log_path": "host-commands.log",
     "total": <int>,

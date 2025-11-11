@@ -97,12 +97,16 @@ variables or inline edits.
 | `MAX_DLL_EXPORTS` | `5` | Maximum number of DLL exports suggested/executed automatically. |
 | `REPORT_SIGNING_KEY_FILE` | _(unset)_ | Path to a secret key used to compute an HMAC over `final-report.json`. |
 | `REPORT_SIGNING_KEY_PASSPHRASE` | _(unset)_ | Optional passphrase concatenated with the key material for signing. |
+| `ENABLE_DEBUG_CHANNEL` | `0` | Create a per-run `diagnostics/debug-console.fifo` for live notes and mirror logs to `diagnostics/infrastructure.log`. |
+| `CREATE_SUPPORT_BUNDLE` | `0` | Force generation of the support bundle even on successful runs (failures always produce one). |
 
 Additional toggles:
 
 * `./orchestrator.sh --no-triage` – skip the triage JSON requirement.
 * `./orchestrator.sh --collect-memory` – force ProcDump collection (off by default for safety).
 * `./orchestrator.sh --keep-clone` – retain the cloned QCOW2 for debugging.
+* `./orchestrator.sh --support-bundle` – always collect the diagnostics bundle even when the run succeeds.
+* `./orchestrator.sh --debug-channel` – expose `diagnostics/debug-console.fifo` to append analyst notes in real time.
 * `./orchestrator.sh --dry-run` – print planned actions without executing.
 * `./orchestrator.sh --debug` – verbose logging for each command.
 * `triage.sh --debug` – embed diagnostic logs in the JSON output.
@@ -186,6 +190,29 @@ hashed (`report_integrity.value`) and, if you provide a secret via
 HMAC-SHA256 signature is added as `report_integrity.hmac_sha256`. This allows
 teams to notarise reports offline and verify that no artefacts were tampered
 with after generation.
+
+### Diagnostics and support bundles
+
+Each run persists a rich diagnostics trail under `<run>/diagnostics/` to help
+debug infrastructure issues without re-running the sample:
+
+* `infrastructure.log` captures every `log`/`err` message emitted by the
+  orchestrator, while `debug-events.jsonl` stores structured milestones (clone,
+  VM start, uploads, report generation).
+* `runtime-state.json` records the latest orchestration state (guest IP,
+  tcpdump PID, heuristic score) so you can check progression at a glance.
+* `support-summary.json` and the optional `support-bundle.tar.gz` contain host
+  health snapshots (`virsh`, `docker ps`, bridge info, disk usage). The bundle
+  is always produced on failure and can be forced on success with
+  `--support-bundle` or `CREATE_SUPPORT_BUNDLE=1`.
+* When `--debug-channel` (or `ENABLE_DEBUG_CHANNEL=1`) is set, the orchestrator
+  exposes `diagnostics/debug-console.fifo`; writing text to this FIFO (e.g.
+  `echo 'note' > diagnostics/debug-console.fifo`) appends analyst notes to the
+  log without altering the automation flow.
+
+The final `final-report.json` includes a `diagnostics` section referencing
+these artefacts, making it easy to cross-check host telemetry alongside the
+static and dynamic evidence.
 
 ## Workflow Summary
 
