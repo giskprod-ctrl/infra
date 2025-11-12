@@ -37,15 +37,35 @@ runs locally without jeopardising the host system.
 > air-gapped; only INetSim, optional Suricata, and the Windows VM should attach
 > to it.
 
+## Environment Bootstrap
+
+Run `./scripts/bootstrap_env.sh` to prepare a fresh host in a single step. The script:
+
+* detects whether `apt`, `dnf`, or `pacman` is available and installs the required packages (QEMU/libvirt tooling, docker, tcpdump, bridge utilities).
+* creates local folders (`samples/`, `out/`, `inetsim/`, `suricata/`) and seeds default configuration templates.
+* copies `autorun.ps1` into `samples/` so the gold image payload is easy to retrieve.
+* can optionally purge captured artefacts and leftover VM clones with `--reset`.
+
+Common options:
+
+* `--reset` – remove `out/`, INetSim/Suricata logs, and any `sandbox-*.qcow2` clones before recreating templates. Combine with `--force` to skip the confirmation prompt.
+* `--no-install` – skip package installation when dependencies are already managed externally.
+* `--force` – suppress the confirmation required by `--reset`.
+
+Re-run the script at any time to refresh templates or to clean the workspace before a new campaign.
+
 ## Quick Start
 
-1. **Prepare the host**
+1. **Bootstrap the host**
    ```bash
+   ./scripts/bootstrap_env.sh
    ./deploy_test_env.sh --bridge br-sandbox
    ```
-   This validates dependencies, ensures KVM is available, creates the `br-sandbox`
-   bridge if required, and prints a hardening checklist. Add `--dry-run` to review
-   actions without executing them.
+   `bootstrap_env.sh` installs distribution packages, provisions local directories
+   (`samples/`, `out/`, INetSim/Suricata configs) and copies `autorun.ps1` for the
+   gold image. `deploy_test_env.sh` then validates KVM availability, creates the
+   `br-sandbox` bridge if required, and prints a hardening checklist. Add
+   `--dry-run` to review actions without executing them.
 
 2. **Bring up supportive services**
    ```bash

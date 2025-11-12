@@ -19,6 +19,8 @@ Prepares the host machine for the sandbox environment:
   * checks KVM acceleration availability
   * creates the isolated bridge if missing
   * reminds you of security guardrails before launching analyses.
+
+Run ./scripts/bootstrap_env.sh first to install prerequisites and provision local directories automatically.
 USAGE
 }
 
@@ -68,6 +70,7 @@ if ((${#missing[@]})); then
   log "Missing tools detected: ${missing[*]}"
   log "Install them using your distribution package manager. Example (Debian/Ubuntu):"
   log "  sudo apt install qemu-utils libguestfs-tools virtinst libvirt-clients tcpdump docker.io docker-compose"
+  log "Or run ./scripts/bootstrap_env.sh to handle installation automatically."
 else
   log "All required binaries found."
 fi
