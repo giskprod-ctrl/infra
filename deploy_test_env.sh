@@ -5,14 +5,43 @@ BRIDGE_NAME="${BRIDGE_NAME:-br-sandbox}"
 FORCE_NONROOT="${FORCE_NONROOT:-1}"
 DRY_RUN=0
 ALLOW_ROOT=0
+BOOTSTRAP_INSTALL=0
+BOOTSTRAP_RESET=0
+BOOTSTRAP_FORCE=0
 TCPDUMP_USER="${TCPDUMP_USER:-$USER}"
 
 log() { echo "[deploy] $*" >&2; }
 die() { echo "[deploy][error] $*" >&2; exit 1; }
 
+invoke_bootstrap() {
+  local -a bootstrap_args=()
+  if [[ $BOOTSTRAP_INSTALL -eq 1 ]]; then
+    bootstrap_args+=(--install)
+  fi
+  if [[ $BOOTSTRAP_RESET -eq 1 ]]; then
+    bootstrap_args+=(--reset)
+  fi
+  if [[ $BOOTSTRAP_FORCE -eq 1 ]]; then
+    bootstrap_args+=(--force)
+  fi
+
+  if [[ ${#bootstrap_args[@]} -eq 0 ]]; then
+    return
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "[dry-run] ./scripts/bootstrap_env.sh ${bootstrap_args[*]}"
+    return
+  fi
+
+  log "Running ./scripts/bootstrap_env.sh ${bootstrap_args[*]}"
+  ./scripts/bootstrap_env.sh "${bootstrap_args[@]}"
+}
+
 print_usage() {
   cat <<'USAGE'
 Usage: ./deploy_test_env.sh [--bridge <name>] [--dry-run] [--allow-root]
+                             [--bootstrap-install] [--bootstrap-reset] [--bootstrap-force]
 
 Prepares the host machine for the sandbox environment:
   * validates dependencies (qemu, libvirt, virt-* tools, docker, tcpdump)
@@ -21,6 +50,12 @@ Prepares the host machine for the sandbox environment:
   * reminds you of security guardrails before launching analyses.
 
 Run ./scripts/bootstrap_env.sh first to install prerequisites and provision local directories automatically.
+Use --bootstrap-install/--bootstrap-reset to invoke it from this helper directly.
+
+Options:
+  --bootstrap-install   Run scripts/bootstrap_env.sh with --install before performing host checks.
+  --bootstrap-reset     Run scripts/bootstrap_env.sh with --reset before performing host checks.
+  --bootstrap-force     Pass --force to scripts/bootstrap_env.sh (typically combined with --bootstrap-reset).
 USAGE
 }
 
@@ -32,6 +67,12 @@ while (("$#")); do
       DRY_RUN=1; shift ;;
     --allow-root)
       ALLOW_ROOT=1; shift ;;
+    --bootstrap-install)
+      BOOTSTRAP_INSTALL=1; shift ;;
+    --bootstrap-reset)
+      BOOTSTRAP_RESET=1; shift ;;
+    --bootstrap-force)
+      BOOTSTRAP_FORCE=1; shift ;;
     -h|--help)
       print_usage; exit 0 ;;
     *)
@@ -42,6 +83,8 @@ done
 if [[ ${FORCE_NONROOT} == "1" && ${ALLOW_ROOT} -eq 0 && $(id -u) -eq 0 ]]; then
   die "Refusing to run as root. Re-run with --allow-root if you really need root privileges."
 fi
+
+invoke_bootstrap
 
 run_cmd() {
   local -a cmd=("$@")

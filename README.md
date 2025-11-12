@@ -39,32 +39,38 @@ runs locally without jeopardising the host system.
 
 ## Environment Bootstrap
 
-Run `./scripts/bootstrap_env.sh` to prepare a fresh host in a single step. The script:
+Run `./scripts/bootstrap_env.sh` to prepare a fresh host. The helper:
 
-* detects whether `apt`, `dnf`, or `pacman` is available and installs the required packages (QEMU/libvirt tooling, docker, tcpdump, bridge utilities).
-* creates local folders (`samples/`, `out/`, `inetsim/`, `suricata/`) and seeds default configuration templates.
-* copies `autorun.ps1` into `samples/` so the gold image payload is easy to retrieve.
-* can optionally purge captured artefacts and leftover VM clones with `--reset`.
+* detects whether `apt`, `dnf`, or `pacman` is available and installs the required packages (QEMU/libvirt tooling, docker, tcpdump, bridge utilities) when `--install` is provided.
+* creates local folders (`samples/`, `out/`, `inetsim/`, `suricata/`, `diagnostics/`) and seeds default configuration templates.
+* copies `autorun.ps1` into `samples/` and seeds `local_av_scanners.json` from `local_av_scanners.example.json` when missing.
+* optionally purges captured artefacts, diagnostics, logs, and any `sandbox-*.qcow2` clones when `--reset` is requested.
 
-Common options:
+Options:
 
-* `--reset` – remove `out/`, INetSim/Suricata logs, and any `sandbox-*.qcow2` clones before recreating templates. Combine with `--force` to skip the confirmation prompt.
-* `--no-install` – skip package installation when dependencies are already managed externally.
-* `--force` – suppress the confirmation required by `--reset`.
+* `--install` – install distribution packages providing QEMU/libvirt utilities, Docker Engine/Compose, and tcpdump.
+* `--reset` – remove generated artefacts (`out/`, `diagnostics/`, INetSim/Suricata logs) and leftover sandbox clones before recreating templates.
+* `--force` – suppress the confirmation prompt normally shown by `--reset`.
 
-Re-run the script at any time to refresh templates or to clean the workspace before a new campaign.
+You can run the bootstrap script directly or invoke it through `./deploy_test_env.sh` with `--bootstrap-install`/`--bootstrap-reset` when combining host validation with provisioning.
 
 ## Quick Start
 
-1. **Bootstrap the host**
+1. **Bootstrap or reset the host**
    ```bash
-   ./scripts/bootstrap_env.sh
-   ./deploy_test_env.sh --bridge br-sandbox
+   # Fresh installation with package provisioning
+   ./deploy_test_env.sh --bootstrap-install --bridge br-sandbox
+
+   # Reset artefacts/logs and recreate templates
+   ./deploy_test_env.sh --bootstrap-reset --bootstrap-force --bridge br-sandbox
    ```
-   `bootstrap_env.sh` installs distribution packages, provisions local directories
-   (`samples/`, `out/`, INetSim/Suricata configs) and copies `autorun.ps1` for the
-   gold image. `deploy_test_env.sh` then validates KVM availability, creates the
-   `br-sandbox` bridge if required, and prints a hardening checklist. Add
+   `deploy_test_env.sh` can invoke `scripts/bootstrap_env.sh` for you. Use
+   `--bootstrap-install` on a new host to install dependencies, provision
+   directories (`samples/`, `out/`, `inetsim/`, `suricata/`, `diagnostics/`), and
+   copy template configs. Add `--bootstrap-reset` (optionally with
+   `--bootstrap-force`) between analysis campaigns to wipe artefacts and remove
+   stale VM clones. The script then validates KVM availability, creates the
+   `br-sandbox` bridge if required, and prints a hardening checklist. Append
    `--dry-run` to review actions without executing them.
 
 2. **Bring up supportive services**
