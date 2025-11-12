@@ -121,6 +121,7 @@ variables or inline edits.
 | `TIMEOUT_SECONDS` | `120` | Execution timeout passed to `autorun.ps1`. |
 | `SUSPICION_THRESHOLD` | `50` | Minimum heuristic score before `triage.sh` marks a sample as suspected. |
 | `MAX_DLL_EXPORTS` | `5` | Maximum number of DLL exports suggested/executed automatically. |
+| `STATIC_STRINGS_LIMIT` | `200` | Number of highest-scoring strings retained inline in the triage JSON before the remainder is written to a sidecar artefact. |
 | `REPORT_SIGNING_KEY_FILE` | _(unset)_ | Path to a secret key used to compute an HMAC over `final-report.json`. |
 | `REPORT_SIGNING_KEY_PASSPHRASE` | _(unset)_ | Optional passphrase concatenated with the key material for signing. |
 | `ENABLE_DEBUG_CHANNEL` | `0` | Create a per-run `diagnostics/debug-console.fifo` for live notes and mirror logs to `diagnostics/infrastructure.log`. |
@@ -190,6 +191,16 @@ weighted `heuristics.score` and lists the reasons that contributed to the
 `suspected` verdict. The script also extracts contextual indicators—URLs,
 IPv4s, registry paths—from the combined string set and records recommended
 `rundll32` invocations when the sample is a DLL.
+
+To keep reports lean, `STATIC_STRINGS_LIMIT` (default `200`) ranks strings by a
+signal-heavy score (indicators, length, structure) and stores only the top
+entries inline. When the string corpus exceeds the limit—or when you explicitly
+set the limit to `0`—the full dump is moved to `<sample>.strings.json` next to
+the triage report and referenced under `static_analysis.string_stats`. Those
+statistics capture the total discovered strings, the retained count, and whether
+truncation occurred. The orchestrator mirrors this metadata into the final
+report and, when the overflow artefact exists, automatically adds it to the
+`attachments` list for quick retrieval.
 
 `SUSPICION_THRESHOLD` and `MAX_DLL_EXPORTS` can be tuned to adjust the
 threshold for heuristic escalation and the number of DLL exports considered.
