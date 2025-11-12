@@ -739,6 +739,16 @@ def read_json(path: Path):
         return {}
 
 
+def hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open('rb') as fh:
+        for chunk in iter(lambda: fh.read(65536), b''):
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 run_dir = Path(os.environ['RUN_DIR'])
 report_path = Path(os.environ['FINAL_REPORT'])
 artifacts_path = Path(os.environ['ARTIFACTS_JSON'])
@@ -788,6 +798,29 @@ if diag_dir.exists():
     diagnostics['generated_at'] = datetime.utcnow().isoformat() + 'Z'
 
 triage = read_json(triage_path) if triage_path.is_file() else {}
+
+overflow_artifact = (
+    triage.get('static_analysis', {})
+    .get('string_stats', {})
+    .get('overflow_artifact')
+)
+if overflow_artifact:
+    overflow_file = Path(overflow_artifact)
+    if overflow_file.exists():
+        try:
+            rel_path = str(overflow_file.relative_to(run_dir))
+        except ValueError:
+            rel_path = str(overflow_file)
+        existing_paths = {attachment['path'] for attachment in attachments}
+        if rel_path not in existing_paths and str(overflow_file) not in existing_paths:
+            attachments.append({
+                'path': rel_path,
+                'sha256': hash_file(overflow_file),
+                'size': overflow_file.stat().st_size,
+            })
+        triage.setdefault('static_analysis', {}).setdefault('string_stats', {})[
+            'overflow_artifact_report_path'
+        ] = rel_path
 
 winrm_file = run_dir / 'winrm-exec.json'
 winrm_data = read_json(winrm_file) if winrm_file.exists() else {}

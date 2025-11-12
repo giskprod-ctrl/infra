@@ -15,7 +15,17 @@
     "suspected": false,
     "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
     "entropy": 6.12,
-    "yara_matches": []
+    "yara_matches": [],
+    "static_analysis": {
+      "string_stats": {
+        "total": 512,
+        "stored": 200,
+        "truncated": 312,
+        "limit": 200,
+        "overflow_artifact": "/workspace/infra/samples/test-safe.exe.strings.json",
+        "overflow_artifact_report_path": "samples/test-safe.exe.strings.json"
+      }
+    }
   },
   "dynamic": {
     "timeout_seconds": 120,
@@ -29,7 +39,8 @@
   },
   "attachments": [
     { "path": "autorun-summary.json", "sha256": "c157a79031e1c40f85931829bc5fc552", "size": 5120 },
-    { "path": "sandbox-20240501-101200-20240501101200.pcap", "sha256": "3d3a9b7fcca9b7f023c0b1d8d53295d7", "size": 2684 }
+    { "path": "sandbox-20240501-101200-20240501101200.pcap", "sha256": "3d3a9b7fcca9b7f023c0b1d8d53295d7", "size": 2684 },
+    { "path": "samples/test-safe.exe.strings.json", "sha256": "e3b0c44298fc1c149afbf4c8996fb924", "size": 0 }
   ],
   "diagnostics": {
     "log_path": "diagnostics/infrastructure.log",
