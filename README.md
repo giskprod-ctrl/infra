@@ -160,6 +160,24 @@ Place your preferred scanners in the triage container, copy the example to
 `local_av_scanners.json`, and the triage report will contain an `av_scans`
 array with per-engine return codes and raw output.
 
+### pe-sieve release management
+
+The triage container bundles the upstream [pe-sieve](https://github.com/hasherezade/pe-sieve)
+release so that analysts can run memory scans without a live download step.
+`triage.Dockerfile` currently pins version **v0.3.5** and verifies the archive
+against the expected SHA-256 hash `ddb1292ad410895696b3606d76f0d8b968d88c78c42170c406e73484de5514e0`
+before extraction. The Docker build will fail automatically if the checksum does
+not match.
+
+When upgrading pe-sieve:
+
+1. Download the desired release asset and compute `sha256sum pe-sieve64.zip` on
+   a trusted workstation.
+2. Update `PESIEVE_VERSION` and `PESIEVE_SHA256` in `triage.Dockerfile` to match
+   the new release.
+3. Rebuild the triage image. If the checksum is incorrect the build stops,
+   protecting against tampering or CDN corruption.
+
 ### Static triage enhancements
 
 The triage pipeline now emits a structured `static_analysis` section populated
