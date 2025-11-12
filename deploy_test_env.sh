@@ -42,12 +42,19 @@ if [[ ${FORCE_NONROOT} == "1" && ${ALLOW_ROOT} -eq 0 && $(id -u) -eq 0 ]]; then
 fi
 
 run_cmd() {
-  if [[ $DRY_RUN -eq 1 ]]; then
-    log "[dry-run] $*"
-  else
-    log "$*"
-    eval "$@"
+  local -a cmd=("$@")
+  if [[ ${#cmd[@]} -eq 0 ]]; then
+    return 0
   fi
+  local formatted
+  formatted=$(printf '%q ' "${cmd[@]}")
+  formatted=${formatted%% }
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "[dry-run] ${formatted}"
+    return 0
+  fi
+  log "${formatted}"
+  "${cmd[@]}"
 }
 
 missing=()
@@ -83,16 +90,21 @@ if [[ -n "${BRIDGE_NAME}" ]]; then
     log "Bridge ${BRIDGE_NAME} already exists."
   else
     log "Creating bridge ${BRIDGE_NAME}"
-    run_cmd "sudo ip link add name ${BRIDGE_NAME} type bridge"
-    run_cmd "sudo ip link set ${BRIDGE_NAME} up"
-    run_cmd "sudo ip addr flush dev ${BRIDGE_NAME}"
+    run_cmd sudo ip link add name "${BRIDGE_NAME}" type bridge
+    run_cmd sudo ip link set "${BRIDGE_NAME}" up
+    run_cmd sudo ip addr flush dev "${BRIDGE_NAME}"
   fi
 fi
 
-log "Ensuring tcpdump can drop privileges to ${TCPDUMP_USER}"
+log "Ensuring tcpdump capture permissions follow host hardening guidance"
 if command -v setcap >/dev/null 2>&1; then
-  run_cmd "sudo setcap 'CAP_NET_RAW+eip CAP_NET_ADMIN+eip' $(command -v tcpdump)"
-  run_cmd "sudo chown ${TCPDUMP_USER}:${TCPDUMP_USER} $(command -v tcpdump)"
+  run_cmd sudo setcap "CAP_NET_RAW+eip CAP_NET_ADMIN+eip" "$(command -v tcpdump)"
+  if getent group pcap >/dev/null 2>&1; then
+    log "Adding ${TCPDUMP_USER} to pcap group for tcpdump access"
+    run_cmd sudo usermod -a -G pcap "${TCPDUMP_USER}"
+  else
+    log "Group 'pcap' not present; consider creating it and granting tcpdump group ownership."
+  fi
 else
   log "setcap not available; tcpdump may require sudo."
 fi

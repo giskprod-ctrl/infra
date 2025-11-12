@@ -1,0 +1,10 @@
+[
+  {
+    "name": "clamav",
+    "cmd": ["clamscan", "--no-summary", "{sample}"]
+  },
+  {
+    "name": "loki",
+    "cmd": ["loki", "--quiet", "--intense", "--file", "{sample}"]
+  }
+]

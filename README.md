@@ -13,8 +13,9 @@ runs locally without jeopardising the host system.
 | `triage.sh` | Performs rapid static/dynamic triage inside the triage container and emits JSON reports.
 | `analyse_adapter/` | Python wrapper for integrating `analysisSimba.py` outputs into a standard JSON structure.
 | `orchestrator.sh` | Manages virtual machine cloning, execution, evidence collection, and final report generation.
-| `autorun.ps1` | PowerShell automation dropped inside the Windows gold image to execute samples and collect in-guest artefacts.
+| `autorun.ps1` | PowerShell automation dropped inside the Windows gold image to execute samples (EXEs or DLL exports), capture baselines/telemetry, and ship memory/network artefacts back to the host.
 | `deploy_test_env.sh` | Host bootstrap script that validates prerequisites and prepares the isolated bridge network.
+| `local_av_scanners.example.json` | Sample configuration for chaining local antivirus engines during triage.
 | `yara_rules/` | Baseline YARA rules for packers, injection primitives, and common droppers.
 | `final-report.template.json` | Template describing the expected report schema.
 | `final-report.example.json` | Minimal example output.
@@ -87,19 +88,131 @@ variables or inline edits.
 | `TRIAGE_IMAGE` | `sandbox-triage` | Name of the triage container image. |
 | `TCPDUMP_ROTATE_SIZE_MB` / `TCPDUMP_FILES` | `50` / `3` | Packet capture rotation policy. |
 | `FORCE_NONROOT` | `1` | Refuse to run scripts as UID 0 unless `--allow-root`. |
+| `LOCAL_AV_CONFIG` | `./local_av_scanners.json` | JSON file listing local AV scanners executed during triage. |
 | `WINRM_PORT` | `5985` | WinRM endpoint inside the guest. |
 | `SMB_UPLOAD_DIR` | `Sandbox\Samples` | Destination directory inside the guest for samples. |
 | `RESULTS_DIR_GUEST` | `C:\results` | Location collected by `virt-copy-out`. |
 | `TIMEOUT_SECONDS` | `120` | Execution timeout passed to `autorun.ps1`. |
+| `SUSPICION_THRESHOLD` | `50` | Minimum heuristic score before `triage.sh` marks a sample as suspected. |
+| `MAX_DLL_EXPORTS` | `5` | Maximum number of DLL exports suggested/executed automatically. |
+| `REPORT_SIGNING_KEY_FILE` | _(unset)_ | Path to a secret key used to compute an HMAC over `final-report.json`. |
+| `REPORT_SIGNING_KEY_PASSPHRASE` | _(unset)_ | Optional passphrase concatenated with the key material for signing. |
+| `ENABLE_DEBUG_CHANNEL` | `0` | Create a per-run `diagnostics/debug-console.fifo` for live notes and mirror logs to `diagnostics/infrastructure.log`. |
+| `CREATE_SUPPORT_BUNDLE` | `0` | Force generation of the support bundle even on successful runs (failures always produce one). |
 
 Additional toggles:
 
 * `./orchestrator.sh --no-triage` – skip the triage JSON requirement.
 * `./orchestrator.sh --collect-memory` – force ProcDump collection (off by default for safety).
 * `./orchestrator.sh --keep-clone` – retain the cloned QCOW2 for debugging.
+* `./orchestrator.sh --support-bundle` – always collect the diagnostics bundle even when the run succeeds.
+* `./orchestrator.sh --debug-channel` – expose `diagnostics/debug-console.fifo` to append analyst notes in real time.
 * `./orchestrator.sh --dry-run` – print planned actions without executing.
 * `./orchestrator.sh --debug` – verbose logging for each command.
 * `triage.sh --debug` – embed diagnostic logs in the JSON output.
+
+### Offline “VirusTotal-style” scanning
+
+`triage.sh` can orchestrate several local antivirus or rule-based scanners to
+approximate the verdict aggregation provided by VirusTotal, while remaining
+fully offline. Provide a JSON configuration either via the
+`LOCAL_AV_CONFIG` path (default `./local_av_scanners.json`) or directly through
+the `AV_SCANNERS_JSON` environment variable. Each entry must define a `name`
+and a command array; occurrences of `{sample}` are replaced with the absolute
+path of the binary under analysis.
+
+Example configuration (`local_av_scanners.example.json`):
+
+```json
+[
+  { "name": "clamav", "cmd": ["clamscan", "--no-summary", "{sample}"] },
+  { "name": "loki", "cmd": ["loki", "--quiet", "--intense", "--file", "{sample}"] }
+]
+```
+
+Place your preferred scanners in the triage container, copy the example to
+`local_av_scanners.json`, and the triage report will contain an `av_scans`
+array with per-engine return codes and raw output.
+
+### Static triage enhancements
+
+The triage pipeline now emits a structured `static_analysis` section populated
+via Rizin JSON commands. In addition to global entropy, the report contains
+per-section entropy, import/export tables, Authenticode metadata (when
+available), and strings/section overviews suitable for offline automation. A
+new heuristic scorer synthesises these signals (including suspicious API
+imports, timestamp anomalies, overlays, and packer-like entropy) into a
+weighted `heuristics.score` and lists the reasons that contributed to the
+`suspected` verdict. The script also extracts contextual indicators—URLs,
+IPv4s, registry paths—from the combined string set and records recommended
+`rundll32` invocations when the sample is a DLL.
+
+`SUSPICION_THRESHOLD` and `MAX_DLL_EXPORTS` can be tuned to adjust the
+threshold for heuristic escalation and the number of DLL exports considered.
+
+### DLL-aware execution workflow
+
+`orchestrator.sh` consumes the new triage metadata to decide whether a sample
+behaves like a DLL. When it does, the orchestrator passes the suggested export
+list to `autorun.ps1`, which in turn executes each export via `rundll32.exe`
+with dedicated stdout/stderr logs, module snapshots, and memory dumps. The
+final report links static exports to the runtime executions so analysts can see
+which entry points ran successfully and which remain pending.
+
+### Dynamic instrumentation and evidence capture
+
+The in-guest automation now performs a comprehensive before/after baseline:
+
+* Captures running processes, services, scheduled tasks, TCP listeners, and key
+  autorun registry entries before launching the sample.
+* Starts dedicated ETW sessions for process, image, and network providers and
+  stops them after execution, saving `*.etl` traces under `results/etw/`.
+* Keeps Procmon running in quiet mode and exports both the `.pml` and a CSV
+  summary, enabling quick correlations from the host.
+* Produces adaptive memory dumps—mid-run, final, and for any detected child
+  processes—using ProcDump when available and falling back to the
+  `comsvcs.dll` MiniDump entry point.
+* Records module inventories for each execution and aggregates child-process
+  trees in `autorun-summary.json`.
+
+On the host side, `final-report.json` incorporates these artefacts into a richer
+`dynamic` section containing baseline diffs, telemetry summaries, stdout/stderr
+previews, and per-execution metadata. The `correlations` block automatically
+cross-references static indicators (URLs/IPs/registry paths) with dynamic
+observations from Procmon/ETW, highlighting overlaps.
+
+### Chain-of-custody and report signing
+
+Every orchestrated command is logged in `host-commands.log` and summarised in
+the final report to strengthen auditability. The canonical report payload is
+hashed (`report_integrity.value`) and, if you provide a secret via
+`REPORT_SIGNING_KEY_FILE` (and optional `REPORT_SIGNING_KEY_PASSPHRASE`), an
+HMAC-SHA256 signature is added as `report_integrity.hmac_sha256`. This allows
+teams to notarise reports offline and verify that no artefacts were tampered
+with after generation.
+
+### Diagnostics and support bundles
+
+Each run persists a rich diagnostics trail under `<run>/diagnostics/` to help
+debug infrastructure issues without re-running the sample:
+
+* `infrastructure.log` captures every `log`/`err` message emitted by the
+  orchestrator, while `debug-events.jsonl` stores structured milestones (clone,
+  VM start, uploads, report generation).
+* `runtime-state.json` records the latest orchestration state (guest IP,
+  tcpdump PID, heuristic score) so you can check progression at a glance.
+* `support-summary.json` and the optional `support-bundle.tar.gz` contain host
+  health snapshots (`virsh`, `docker ps`, bridge info, disk usage). The bundle
+  is always produced on failure and can be forced on success with
+  `--support-bundle` or `CREATE_SUPPORT_BUNDLE=1`.
+* When `--debug-channel` (or `ENABLE_DEBUG_CHANNEL=1`) is set, the orchestrator
+  exposes `diagnostics/debug-console.fifo`; writing text to this FIFO (e.g.
+  `echo 'note' > diagnostics/debug-console.fifo`) appends analyst notes to the
+  log without altering the automation flow.
+
+The final `final-report.json` includes a `diagnostics` section referencing
+these artefacts, making it easy to cross-check host telemetry alongside the
+static and dynamic evidence.
 
 ## Workflow Summary
 
@@ -107,8 +220,9 @@ Additional toggles:
 2. Run triage via the container (`triage.sh`), examine the JSON verdict.
 3. If suspicious (or forced), execute `orchestrator.sh --sample <file>`.
 4. Inspect `/out/<timestamp>/` for:
-   * `final-report.json` – consolidated metadata, triage verdict, dynamic verdict, attachments list, report signature.
+   * `final-report.json` – consolidated metadata, static heuristics, dynamic instrumentation summary, correlations, attachments list, and integrity/HMAC details.
    * `artifacts.json` – per-file hashes and sizes (pcaps, Procmon logs, memory dumps).
+   * `host-commands.log` – JSONL audit log of commands executed on the host orchestrator.
    * `winrm-exec.json` – raw WinRM execution transcript.
    * Collected guest artefacts (`autorun-summary.json`, `stdout.log`, `procmon.pml`, etc.) and rotated PCAPs.
 5. Use `analyse_adapter/adapter.py` to integrate additional tooling outputs as
@@ -133,6 +247,7 @@ Additional toggles:
 - [ ] Run scripts as a non-root user unless a flag explicitly allows root.
 - [ ] Confirm `qemu-img create -b` clones are deleted after each run (default behaviour).
 - [ ] Review `artifacts.json` and `final-report.json` for SHA-256 values before moving artefacts.
+- [ ] Configure `REPORT_SIGNING_KEY_FILE` if you require authenticated reports for external sharing.
 - [ ] Keep the gold image offline and patch it using a separate workflow.
 - [ ] Never mount the base QCOW2 read-write while analyses are running.
 - [ ] Validate INetSim logs before trusting dynamic verdicts.
