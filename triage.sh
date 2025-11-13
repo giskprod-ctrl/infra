@@ -16,14 +16,43 @@ MAX_DLL_EXPORTS="${MAX_DLL_EXPORTS:-5}"
 
 print_usage() {
   cat <<'USAGE'
-Usage: ./triage.sh --file <sample_path> [--json <output_json>] [--debug]
+Usage: ./triage.sh --file <sample_path> [--json <output_json>] [--debug] \
+                   [--yara-index <path>] [--yara-category <name>]
 
 Runs static/rapid dynamic triage for the specified PE file.
 Environment variables override defaults defined at the top of the script.
+
+`--yara-index` may be repeated to point to custom rule indexes. Use
+`--yara-category` to select built-in categories (e.g. `malware`, `lolbin`,
+`internal`, `vendor/signature-base`).
 USAGE
 }
 
 log() { echo "[triage] $*" >&2; }
+
+abs_path() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+print(os.path.abspath(path))
+PY
+}
+
+rel_path() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+target = os.path.abspath(sys.argv[1])
+base = os.path.abspath(sys.argv[2])
+try:
+    print(os.path.relpath(target, base))
+except ValueError:
+    print(target)
+PY
+}
 
 if ! command -v jq >/dev/null 2>&1; then
   log "jq is required"
@@ -38,6 +67,8 @@ fi
 SAMPLE=""
 OUTPUT_JSON=""
 DEBUG=0
+declare -a CLI_YARA_INDEXES=()
+declare -a CLI_YARA_CATEGORIES=()
 
 while (("$#")); do
   case "$1" in
@@ -47,6 +78,10 @@ while (("$#")); do
       OUTPUT_JSON="$2"; shift 2 ;;
     --debug)
       DEBUG=1; shift ;;
+    --yara-index)
+      CLI_YARA_INDEXES+=("$2"); shift 2 ;;
+    --yara-category)
+      CLI_YARA_CATEGORIES+=("$2"); shift 2 ;;
     -h|--help)
       print_usage; exit 0 ;;
     *)
@@ -69,6 +104,55 @@ mkdir -p "$(dirname "${OUTPUT_JSON}")"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT
+
+YARA_RULE_DIR_ABS=""
+if [[ -d "${YARA_RULE_DIR}" ]]; then
+  YARA_RULE_DIR_ABS="$(abs_path "${YARA_RULE_DIR}")"
+fi
+
+declare -a SELECTED_YARA_INDEXES=()
+
+if [[ ${#CLI_YARA_INDEXES[@]} -eq 0 && ${#CLI_YARA_CATEGORIES[@]} -eq 0 ]]; then
+  if [[ -n "${YARA_RULE_DIR_ABS}" && -f "${YARA_RULE_DIR_ABS}/index.yar" ]]; then
+    SELECTED_YARA_INDEXES+=("${YARA_RULE_DIR_ABS}/index.yar")
+  fi
+else
+  for index_path in "${CLI_YARA_INDEXES[@]}"; do
+    resolved_path="$(abs_path "${index_path}")"
+    if [[ -f "${resolved_path}" ]]; then
+      SELECTED_YARA_INDEXES+=("${resolved_path}")
+    else
+      log "YARA index ${index_path} not found"
+    fi
+  done
+
+  for category in "${CLI_YARA_CATEGORIES[@]}"; do
+    if [[ -z "${YARA_RULE_DIR_ABS}" ]]; then
+      log "Cannot resolve category ${category} without YARA_RULE_DIR"
+      continue
+    fi
+    category_index="${YARA_RULE_DIR_ABS}/${category}/index.yar"
+    if [[ -f "${category_index}" ]]; then
+      SELECTED_YARA_INDEXES+=("${category_index}")
+    else
+      log "Category index ${category_index} not found"
+    fi
+  done
+fi
+
+declare -a UNIQUE_YARA_INDEXES=()
+declare -A _seen_indexes=()
+for candidate in "${SELECTED_YARA_INDEXES[@]}"; do
+  key="${candidate}"
+  if [[ -n "${key}" && -z "${_seen_indexes[$key]+x}" ]]; then
+    UNIQUE_YARA_INDEXES+=("${key}")
+    _seen_indexes["${key}"]=1
+  fi
+done
+
+if [[ ${#UNIQUE_YARA_INDEXES[@]} -eq 0 ]]; then
+  log "No YARA indexes selected; skipping YARA scan stage"
+fi
 
 sha256=$(sha256sum "${SAMPLE_ABS}" | awk '{print $1}')
 size=$(stat --printf="%s" "${SAMPLE_ABS}")
@@ -568,14 +652,223 @@ else
 fi
 
 yara_matches=()
-if command -v yara >/dev/null 2>&1 && [[ -d "${YARA_RULE_DIR}" ]]; then
-  mapfile -t yara_matches < <(yara -w -g -m "${YARA_RULE_DIR}" "${SAMPLE_ABS}" 2>/dev/null | awk '{print $1}')
+yara_json='[]'
+yara_metrics_json='{}'
+yara_family_breakdown_json='{"counts":{},"matches":{}}'
+noisy_rules_json='[]'
+yara_inventory_json='{}'
+
+if [[ ${#UNIQUE_YARA_INDEXES[@]} -gt 0 ]]; then
+  if yara_inventory_json=$(python3 - "${YARA_RULE_DIR_ABS}" "${UNIQUE_YARA_INDEXES[@]}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+rule_dir_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+rule_dir = Path(rule_dir_arg).resolve() if rule_dir_arg else None
+indexes = [Path(p).resolve() for p in sys.argv[2:]]
+
+include_re = re.compile(r'^\s*include\s+"([^"]+)"')
+rule_re = re.compile(r'^\s*(?:private\s+)?rule\s+([A-Za-z0-9_]+)')
+
+seen = set()
+files = set()
+missing = set()
+rule_count = 0
+index_summaries = []
+
+def resolve_include(base_path: Path, include_target: str) -> Path:
+    candidate = Path(include_target)
+    if not candidate.is_absolute():
+        candidate = (base_path / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return candidate
+
+def walk(path: Path):
+    global rule_count
+    if path in seen:
+        return
+    seen.add(path)
+    if not path.exists():
+        missing.add(str(path))
+        return
+    files.add(str(path))
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        lines = []
+    for line in lines:
+        match = include_re.match(line)
+        if match:
+            target = resolve_include(path.parent, match.group(1))
+            walk(target)
+        elif rule_re.match(line):
+            rule_count += 1
+
+for index_path in indexes:
+    before = rule_count
+    walk(index_path)
+    added = rule_count - before
+    relative = None
+    if rule_dir is not None:
+        try:
+            relative = str(index_path.relative_to(rule_dir))
+        except ValueError:
+            relative = None
+    index_summaries.append({
+        "path": str(index_path),
+        "relative": relative,
+        "rules": added
+    })
+
+print(json.dumps({
+    "rule_files": sorted(files),
+    "missing": sorted(missing),
+    "rule_count": rule_count,
+    "index_summaries": index_summaries
+}))
+PY
+  ); then
+    :
+  else
+    log "Failed to enumerate YARA inventory"
+    yara_inventory_json='{}'
+  fi
 fi
 
-yara_json='[]'
+yara_total_rules=$(jq -r '(.rule_count // 0)' <<<"${yara_inventory_json}" 2>/dev/null || echo 0)
+yara_index_summaries=$(jq -c '(.index_summaries // [])' <<<"${yara_inventory_json}" 2>/dev/null || echo '[]')
+yara_rule_files=$(jq -c '(.rule_files // [])' <<<"${yara_inventory_json}" 2>/dev/null || echo '[]')
+yara_missing_files=$(jq -c '(.missing // [])' <<<"${yara_inventory_json}" 2>/dev/null || echo '[]')
+
+noisy_rules_file=""
+if [[ -n "${YARA_RULE_DIR_ABS}" ]]; then
+  noisy_rules_file="${YARA_RULE_DIR_ABS}/internal/noisy_rules.txt"
+fi
+declare -A NOISY_RULE_SET=()
+if [[ -n "${noisy_rules_file}" && -f "${noisy_rules_file}" ]]; then
+  while IFS= read -r noisy_rule; do
+    [[ -z "${noisy_rule}" ]] && continue
+    NOISY_RULE_SET["${noisy_rule}"]=1
+  done < <(python3 - "${noisy_rules_file}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    line = line.split('#', 1)[0].strip()
+    if line:
+        print(line)
+PY
+  )
+fi
+
+declare -A YARA_MATCH_SET=()
+declare -A FAMILY_MATCH_COUNT=()
+declare -A NOISY_MATCH_SEEN=()
+declare -a noisy_hits=()
+yara_matches_file="${TMPDIR}/yara-matches.txt"
+>"${yara_matches_file}"
+
+if command -v yara >/dev/null 2>&1 && [[ ${#UNIQUE_YARA_INDEXES[@]} -gt 0 ]]; then
+  for index_path in "${UNIQUE_YARA_INDEXES[@]}"; do
+    if [[ ! -f "${index_path}" ]]; then
+      continue
+    fi
+
+    family_label="custom"
+    if [[ -n "${YARA_RULE_DIR_ABS}" ]]; then
+      rel="$(rel_path "${index_path}" "${YARA_RULE_DIR_ABS}")"
+      rel_base="${rel%/index.yar}"
+      if [[ -z "${rel_base}" || "${rel}" == "index.yar" ]]; then
+        family_label="root"
+      else
+        family_label="${rel_base}"
+      fi
+    fi
+
+    err_file="${TMPDIR}/yara-${RANDOM}.err"
+    set +e
+    yara_stdout="$(yara --fail-on-warnings -w -g -m "${index_path}" "${SAMPLE_ABS}" 2>"${err_file}")"
+    yara_rc=$?
+    set -e
+
+    if [[ ${yara_rc} -gt 1 ]]; then
+      log "YARA execution failed for ${index_path}"
+      continue
+    fi
+
+    if [[ -s "${err_file}" ]]; then
+      log "YARA warnings emitted for ${index_path}"
+      while IFS= read -r warning_line; do
+        log "  ${warning_line}"
+      done <"${err_file}"
+    fi
+
+    while IFS= read -r rule_name; do
+      [[ -z "${rule_name}" ]] && continue
+      if [[ -z "${YARA_MATCH_SET[${rule_name}]+x}" ]]; then
+        yara_matches+=("${rule_name}")
+        YARA_MATCH_SET["${rule_name}"]=1
+      fi
+      current_count=${FAMILY_MATCH_COUNT["${family_label}"]:-0}
+      FAMILY_MATCH_COUNT["${family_label}"]=$(( current_count + 1 ))
+      printf '%s %s\n' "${family_label}" "${rule_name}" >>"${yara_matches_file}"
+      if [[ -n "${NOISY_RULE_SET[${rule_name}]+x}" && -z "${NOISY_MATCH_SEEN[${rule_name}]+x}" ]]; then
+        noisy_hits+=("${rule_name}")
+        NOISY_MATCH_SEEN["${rule_name}"]=1
+      fi
+    done < <(printf '%s\n' "${yara_stdout}" | awk '{print $1}')
+  done
+fi
+
 if [[ ${#yara_matches[@]} -gt 0 ]]; then
   yara_json=$(printf '%s\n' "${yara_matches[@]}" | jq -Rcs 'split("\n") | map(select(length>0))')
 fi
+
+if [[ -s "${yara_matches_file}" ]]; then
+  yara_family_breakdown_json=$(python3 - "${yara_matches_file}" <<'PY'
+import json
+import sys
+from collections import OrderedDict
+
+counts = OrderedDict()
+matches = {}
+with open(sys.argv[1], 'r', encoding='utf-8') as handle:
+    for line in handle:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            family, rule = line.split(' ', 1)
+        except ValueError:
+            continue
+        counts[family] = counts.get(family, 0) + 1
+        matches.setdefault(family, []).append(rule)
+
+print(json.dumps({"counts": counts, "matches": matches}))
+PY
+  )
+fi
+
+noisy_rules_json='[]'
+if [[ ${#noisy_hits[@]} -gt 0 ]]; then
+  noisy_rules_json=$(printf '%s\n' "${noisy_hits[@]}" | jq -Rcs 'split("\n") | map(select(length>0))')
+  noisy_log_path="$(dirname "${OUTPUT_JSON}")/triage-noisy.log"
+  while IFS= read -r noisy_entry; do
+    [[ -z "${noisy_entry}" ]] && continue
+    printf '%s %s %s\n' "$(date --iso-8601=seconds)" "${SAMPLE_NAME}" "${noisy_entry}" >>"${noisy_log_path}"
+  done <<<"$(printf '%s\n' "${noisy_hits[@]}")"
+fi
+
+yara_metrics_json=$(jq -n \
+  --argjson total_rules "${yara_total_rules}" \
+  --argjson indexes "${yara_index_summaries}" \
+  --argjson rule_files "${yara_rule_files}" \
+  --argjson missing "${yara_missing_files}" \
+  '{total_rules:$total_rules, indexes:$indexes, rule_files:$rule_files, missing:$missing}')
 
 av_results=()
 load_av_config() {
@@ -730,6 +1023,9 @@ cat <<JSON > "${OUTPUT_JSON}"
   "filetype": "${filetype}",
   "entropy": ${entropy},
   "yara_matches": ${yara_json},
+  "yara_metrics": ${yara_metrics_json},
+  "yara_families": ${yara_family_breakdown_json},
+  "yara_noisy_rules": ${noisy_rules_json},
   "pesieve": {
     "status": "${pesieve_status}",
     "log_tail": $(jq -Rs '.' <<<"${pesieve_stdout}")

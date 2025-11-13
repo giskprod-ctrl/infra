@@ -16,7 +16,7 @@ runs locally without jeopardising the host system.
 | `autorun.ps1` | PowerShell automation dropped inside the Windows gold image to execute samples (EXEs or DLL exports), capture baselines/telemetry, and ship memory/network artefacts back to the host.
 | `deploy_test_env.sh` | Host bootstrap script that validates prerequisites and prepares the isolated bridge network.
 | `local_av_scanners.example.json` | Sample configuration for chaining local antivirus engines during triage.
-| `yara_rules/` | Baseline YARA rules for packers, injection primitives, and common droppers.
+| `yara_rules/` | Structured YARA catalogue (malware, LOLBIN, internal overrides, curated vendor mirrors).
 | `final-report.template.json` | Template describing the expected report schema.
 | `final-report.example.json` | Minimal example output.
 
@@ -96,6 +96,48 @@ You can run the bootstrap script directly or invoke it through `./deploy_test_en
    `autorun.ps1` through WinRM, captures traffic (`tcpdump`) and artefacts, and
    writes `/out/<timestamp>/final-report.json` plus all evidence. Use
    `--dry-run`, `--debug`, or `--keep-clone` while testing.
+
+### YARA rule management and tuning
+
+The `yara_rules/` tree is now split into dedicated catalogues:
+
+* `malware/` – in-house rules for packers, droppers, and injection tradecraft.
+* `lolbin/` – detections for living-off-the-land binaries and scripts.
+* `internal/` – overrides (`overrides.yar`) and noise tracking (`noisy_rules.txt`).
+* `vendor/` – curated mirrors of trusted open-source projects (signature-base, yara-forensics, Elastic).
+
+**Update policy**
+
+* **Cadence:** Refresh vendor mirrors and internal rules during the first week of every month, or immediately after major intelligence drops.
+* **Owner:** Detection Engineering (contact: `detections@infra.local`). Submit PRs for structural changes or emergency fixes outside the regular window.
+* **Process:**
+  1. Pull upstream mirrors (or run the sync helper once created) and review upstream changelogs for impactful signatures.
+  2. De-duplicate rules by name across `vendor/` and internal categories. Prefer the vendor implementation when semantics overlap.
+  3. Adjust conditions (e.g. PE header gates, stricter string combinations) to minimise false positives before promoting updates to `malware/` or `lolbin/`.
+  4. Update `internal/noisy_rules.txt` if a vendor rule is known to be noisy but still valuable. Add targeted suppressions in `internal/overrides.yar` when outright disabling is necessary.
+
+**Validation workflow**
+
+Run the following checks before pushing updates:
+
+```bash
+# Ensure the combined catalogue is syntactically correct
+yara --fail-on-warnings -w -g -m yara_rules/index.yar samples/benign/
+
+# Exercise curated malicious samples to confirm expected hits
+yara --fail-on-warnings -w -g -r yara_rules/index.yar samples/malware/
+
+# Compile once to catch issues missed by the CLI run
+yarac yara_rules/index.yar /tmp/ruleset.yarac
+```
+
+The `samples/benign/` and `samples/malware/` folders should contain your local validation corpus (hash-locked and documented separately). Capture resulting metrics via `triage.sh --file ... --debug` to archive coverage numbers alongside the PR.
+
+**Tuning noisy rules**
+
+* List noisy rule identifiers in `yara_rules/internal/noisy_rules.txt` – matching rules are appended to `triage-noisy.log` during runs.
+* Use `yara_rules/internal/overrides.yar` to suppress, alias, or wrap upstream detections without forking the vendor files.
+* `triage.sh` accepts `--yara-category <name>` and `--yara-index <path>` to scope scans per family. The generated report surfaces `yara_metrics`, per-family match counts, and noisy-rule telemetry to help analysts decide whether to tune or disable signatures.
 
 ## Configurable Variables
 
