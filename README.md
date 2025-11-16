@@ -105,6 +105,13 @@ them further:
   before `main`/`DllMain`.
 * **Data-directory sanity checks** – inconsistent RVA/size entries are recorded
   and wired into the suspicion score to catch malformed PE headers.
+* **Version info + CodeView metadata** – when the optional `pefile` module is
+  installed (`pip install pefile` or `apt install python3-pefile`), the triage
+  JSON now captures version strings, fixed-file flags, and embedded PDB/CodeView
+  GUIDs to simplify provenance checks.
+* **Per-section hashing & RWX detection** – each section receives its own SHA-256
+  hash and the heuristic engine raises a dedicated flag when a section is both
+  writable and executable.
 * **ssdeep / fuzzy hashes** – if the `ssdeep` binary is present, the fuzzy hash
   is injected into `static_analysis.hashes`. Install it via `apt install ssdeep`
   (or the equivalent package on your distribution) to unlock this signal.

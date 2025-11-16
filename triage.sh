@@ -205,6 +205,8 @@ collect_static_metadata() {
   local out_file="$3"
   local max_exports="$4"
   local threshold="$5"
+  python3 - "$sample_path" "$rizin_bin" "$out_file" "$max_exports" "$threshold" <<'PY'
+import hashlib
   local strings_limit="$6"
   local strings_dir="$7"
   python3 - "$sample_path" "$rizin_bin" "$out_file" "$max_exports" "$threshold" "$strings_limit" "$strings_dir" <<'PY'
@@ -216,6 +218,11 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import pefile  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pefile = None
 
 sample = Path(sys.argv[1])
 rizin_bin = sys.argv[2]
@@ -458,6 +465,7 @@ def parse_pe_metadata(path: Path):
         if section_end > max_end:
             max_end = section_end
 
+        section_hash = hashlib.sha256(section_data).hexdigest() if section_data else None
         sections.append({
             "name": name,
             "virtual_size": virtual_size,
@@ -468,6 +476,7 @@ def parse_pe_metadata(path: Path):
             "characteristics": characteristics_section,
             "executable": bool(characteristics_section & 0x20000000),
             "writable": bool(characteristics_section & 0x80000000),
+            "sha256": section_hash,
         })
 
     result["sections"] = sections
@@ -668,6 +677,75 @@ imphash = compute_imphash(import_descriptors)
 tls_info = parse_tls_callbacks(file_bytes)
 rich_info = extract_rich_header(file_bytes)
 
+version_info_strings = {}
+fixed_file_info = {}
+pdb_signatures = []
+
+def guid_from_bytes(data: bytes) -> str:
+    if len(data) != 16:
+        return data.hex()
+    d1, d2, d3 = struct.unpack("<IHH", data[:8])
+    d4 = data[8:10]
+    d5 = data[10:]
+    return f"{d1:08x}-{d2:04x}-{d3:04x}-{d4.hex()}-{d5.hex()}"
+
+if pefile is not None:
+    try:
+        pe = pefile.PE(data=file_bytes, fast_load=False)
+        if getattr(pe, "FileInfo", None):
+            for fileinfo in pe.FileInfo:
+                key = getattr(fileinfo, "Key", b"")
+                if isinstance(key, bytes):
+                    key = key.decode("utf-8", errors="ignore")
+                if key != "StringFileInfo":
+                    continue
+                for string_table in getattr(fileinfo, "StringTable", []):
+                    for name, value in string_table.entries.items():
+                        version_info_strings[name.decode("utf-8", errors="ignore")] = (
+                            value.decode("utf-8", errors="ignore")
+                        )
+        vs_fixed = getattr(pe, "VS_FIXEDFILEINFO", None)
+        if vs_fixed:
+            fixed_file_info = {
+                "file_version": f"{vs_fixed.FileVersionMS >> 16}.{vs_fixed.FileVersionMS & 0xFFFF}."
+                f"{vs_fixed.FileVersionLS >> 16}.{vs_fixed.FileVersionLS & 0xFFFF}",
+                "product_version": f"{vs_fixed.ProductVersionMS >> 16}.{vs_fixed.ProductVersionMS & 0xFFFF}."
+                f"{vs_fixed.ProductVersionLS >> 16}.{vs_fixed.ProductVersionLS & 0xFFFF}",
+                "file_flags": vs_fixed.FileFlags,
+                "os": vs_fixed.FileOS,
+                "file_type": vs_fixed.FileType,
+            }
+        if hasattr(pe, "DIRECTORY_ENTRY_DEBUG"):
+            raw_data = pe.__data__
+            for entry in pe.DIRECTORY_ENTRY_DEBUG:
+                if entry.struct.Type != 2:  # IMAGE_DEBUG_TYPE_CODEVIEW
+                    continue
+                pointer = entry.struct.PointerToRawData
+                size = entry.struct.SizeOfData
+                if pointer == 0 or size == 0:
+                    continue
+                blob = raw_data[pointer : pointer + size]
+                if len(blob) < 24 or blob[:4] not in (b"RSDS", b"NB10"):
+                    continue
+                if blob[:4] == b"RSDS":
+                    guid = guid_from_bytes(blob[4:20])
+                    age = struct.unpack_from("<I", blob, 20)[0]
+                    path = blob[24:].split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+                else:  # NB10
+                    timestamp, age = struct.unpack_from("<II", blob, 4)
+                    guid = f"{timestamp:08x}"
+                    path = blob[12:].split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+                pdb_signatures.append({
+                    "path": path,
+                    "guid": guid,
+                    "age": age,
+                    "format": blob[:4].decode("ascii", errors="ignore"),
+                })
+    except Exception as exc:  # pragma: no cover - defensive
+        analysis.setdefault("errors", []).append(f"pefile_parse_error:{exc}")
+elif pefile is None:
+    analysis.setdefault("warnings", []).append("pefile_not_installed")
+
 analysis["advanced_imports"] = import_descriptors
 hashes_section = analysis.setdefault("hashes", {})
 if imphash:
@@ -677,6 +755,12 @@ if tls_info:
     analysis["tls"] = tls_info
 if rich_info.get("hash"):
     hashes_section["richhash"] = rich_info.get("hash")
+if version_info_strings:
+    analysis["version_info"] = version_info_strings
+if fixed_file_info:
+    analysis["version_fixed"] = fixed_file_info
+if pdb_signatures:
+    analysis["debug_directory"] = {"codeview": pdb_signatures}
 
 imports = analysis["rizin"].get("imports") or []
 exports = analysis["rizin"].get("exports") or []
@@ -860,6 +944,12 @@ packed_sections = [
     if isinstance(section.get("entropy"), (int, float)) and section["entropy"] >= 7.2
 ]
 
+rw_sections = [
+    section.get("name")
+    for section in pe_metadata.get("sections", [])
+    if section.get("executable") and section.get("writable")
+]
+
 data_directory_anomalies = []
 for entry in pe_metadata.get("data_directories", []) or []:
     rva = entry.get("rva") or 0
@@ -879,6 +969,8 @@ heuristics = {
         "data_directory_anomalies": [entry.get("name") for entry in data_directory_anomalies],
         "tls_callbacks": analysis.get("tls", {}).get("callbacks", []),
         "missing_import_table": not bool(import_descriptors),
+        "rwx_sections": rw_sections,
+        "version_info_present": bool(version_info_strings),
     },
     "suspicious_imports": suspect_imports,
 }
@@ -930,6 +1022,12 @@ if pe_metadata.get("is_pe") and not import_descriptors:
 
 if data_directory_anomalies:
     add_reason("Inconsistent PE data directory entries", 10)
+
+if rw_sections:
+    add_reason("Writable + executable sections detected", 15)
+
+if pe_metadata.get("is_pe") and not version_info_strings:
+    add_reason("Version info resource absent", 5)
 
 heuristics["score"] = min(100, heuristics["score"])
 heuristics["suggested_suspect"] = heuristics["score"] >= threshold
