@@ -178,6 +178,15 @@ print(f"{entropy:.4f}")
 PY
 )
 
+ssdeep_hash=""
+if command -v ssdeep >/dev/null 2>&1; then
+  if ssdeep_output=$(ssdeep -b "${SAMPLE_ABS}" 2>/dev/null); then
+    ssdeep_hash=$(printf '%s\n' "${ssdeep_output}" | tail -n +2 | head -n 1 | cut -d',' -f2)
+  fi
+else
+  log "ssdeep binary not found, skipping fuzzy hash"
+fi
+
 run_wine() {
   local cmd="$1"; shift
   if command -v wine64 >/dev/null 2>&1; then
@@ -196,6 +205,7 @@ collect_static_metadata() {
   local max_exports="$4"
   local threshold="$5"
   python3 - "$sample_path" "$rizin_bin" "$out_file" "$max_exports" "$threshold" <<'PY'
+import hashlib
 import json
 import math
 import re
@@ -283,6 +293,9 @@ def parse_pe_metadata(path: Path):
         "overlay_size": 0,
         "size_of_image": None,
         "size_of_headers": None,
+        "image_base": None,
+        "address_of_entry_point": None,
+        "data_directories": [],
     }
     characteristics_map = {
         0x0002: "executable_image",
@@ -291,7 +304,6 @@ def parse_pe_metadata(path: Path):
         0x0008: "local_syms_stripped",
         0x0020: "large_address_aware",
         0x0100: "32bit_machine",
-        0x2000: "dll",
         0x1000: "system",
     }
 
@@ -299,18 +311,18 @@ def parse_pe_metadata(path: Path):
         data = path.read_bytes()
     except Exception as exc:  # pragma: no cover - defensive
         analysis.setdefault("errors", []).append(f"read_error:{exc}")
-        return result, data if 'data' in locals() else b""
+        return result, data if 'data' in locals() else b"", {}
 
     if len(data) < 0x40 or data[:2] != b"MZ":
-        return result, data
+        return result, data, {}
 
     try:
         e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
     except struct.error:
-        return result, data
+        return result, data, {}
 
     if e_lfanew + 0x18 >= len(data) or data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
-        return result, data
+        return result, data, {}
 
     result["is_pe"] = True
 
@@ -319,7 +331,7 @@ def parse_pe_metadata(path: Path):
             "<HHIIIHH", data, e_lfanew + 4
         )
     except struct.error:
-        return result, data
+        return result, data, {}
 
     result["characteristics_raw"] = characteristics
     for flag, name in characteristics_map.items():
@@ -346,6 +358,9 @@ def parse_pe_metadata(path: Path):
     except struct.error:
         magic = None
 
+    is_pe32_plus = magic == 0x20B
+    pointer_size = 8 if is_pe32_plus else 4
+
     entry_point_rva = None
     size_of_image = None
     size_of_headers = None
@@ -363,9 +378,46 @@ def parse_pe_metadata(path: Path):
         size_of_headers = struct.unpack_from("<I", data, optional_offset + 0x3C)[0]
 
     result["entry_point_rva"] = entry_point_rva
+    result["address_of_entry_point"] = entry_point_rva
     result["image_base"] = image_base
     result["size_of_image"] = size_of_image
     result["size_of_headers"] = size_of_headers
+    result["optional_header_magic"] = magic
+
+    # Data directories
+    data_directories = []
+    data_directory_names = [
+        "export_table",
+        "import_table",
+        "resource_table",
+        "exception_table",
+        "certificate_table",
+        "base_relocation_table",
+        "debug_directory",
+        "architecture",
+        "global_ptr",
+        "tls_table",
+        "load_config_table",
+        "bound_import",
+        "iat",
+        "delay_import_descriptor",
+        "clr_runtime_header",
+        "reserved",
+    ]
+    dd_offset = optional_offset + (96 if not is_pe32_plus else 112)
+    number_of_rva_and_sizes = min(16, (size_optional_header - (dd_offset - optional_offset)) // 8)
+    for idx in range(number_of_rva_and_sizes):
+        entry_offset = dd_offset + idx * 8
+        if entry_offset + 8 > len(data):
+            break
+        rva, size_entry = struct.unpack_from("<II", data, entry_offset)
+        data_directories.append({
+            "name": data_directory_names[idx],
+            "rva": rva,
+            "size": size_entry,
+        })
+
+    result["data_directories"] = data_directories
 
     section_table_offset = optional_offset + size_optional_header
     sections = []
@@ -425,10 +477,202 @@ def parse_pe_metadata(path: Path):
                 result["entry_point_section"] = section["name"]
                 break
 
-    return result, data
+    return result, data, {
+        "e_lfanew": e_lfanew,
+        "is_pe32_plus": is_pe32_plus,
+        "pointer_size": pointer_size,
+    }
 
-pe_metadata, file_bytes = parse_pe_metadata(sample)
+pe_metadata, file_bytes, pe_context = parse_pe_metadata(sample)
 analysis["pe_metadata"] = pe_metadata
+
+sections_for_rva = pe_metadata.get("sections", [])
+
+def rva_to_offset(rva: int):
+    for section in sections_for_rva:
+        va = section.get("virtual_address") or 0
+        raw = section.get("raw_offset") or 0
+        size_virtual = section.get("virtual_size") or 0
+        size_raw = section.get("raw_size") or 0
+        size = max(size_virtual, size_raw)
+        if size == 0:
+            continue
+        if va <= rva < va + size:
+            return raw + (rva - va)
+    headers_size = pe_metadata.get("size_of_headers") or 0
+    if 0 <= rva < headers_size:
+        return rva
+    return None
+
+def read_c_string(blob: bytes, offset: int) -> str:
+    if offset is None or offset < 0 or offset >= len(blob):
+        return ""
+    end = blob.find(b"\x00", offset)
+    if end == -1:
+        end = len(blob)
+    return blob[offset:end].decode("utf-8", errors="replace")
+
+def parse_import_descriptors(blob: bytes):
+    imports_dir = None
+    for entry in pe_metadata.get("data_directories", []):
+        if entry.get("name") == "import_table":
+            imports_dir = entry
+            break
+    if not imports_dir or not imports_dir.get("rva"):
+        return []
+    descriptor_offset = rva_to_offset(imports_dir["rva"])
+    if descriptor_offset is None:
+        return []
+    pointer_size = pe_context.get("pointer_size", 4)
+    fmt = "<Q" if pointer_size == 8 else "<I"
+    descriptors = []
+    while descriptor_offset + 20 <= len(blob):
+        fields = struct.unpack_from("<IIIII", blob, descriptor_offset)
+        descriptor_offset += 20
+        original_first_thunk, time_date_stamp, forwarder_chain, name_rva, first_thunk = fields
+        if not any(fields):
+            break
+        dll_name = read_c_string(blob, rva_to_offset(name_rva))
+        thunk_rva = original_first_thunk or first_thunk
+        thunk_offset = rva_to_offset(thunk_rva)
+        imports_local = []
+        if thunk_offset is not None:
+            while thunk_offset + pe_context.get("pointer_size", 4) <= len(blob):
+                thunk_data = struct.unpack_from(fmt, blob, thunk_offset)[0]
+                thunk_offset += pe_context.get("pointer_size", 4)
+                if thunk_data == 0:
+                    break
+                if pe_context.get("pointer_size", 4) == 8:
+                    ordinal_flag = 0x8000000000000000
+                    ordinal_mask = 0xFFFF
+                else:
+                    ordinal_flag = 0x80000000
+                    ordinal_mask = 0xFFFF
+                import_by_ordinal = bool(thunk_data & ordinal_flag)
+                ordinal = thunk_data & ordinal_mask if import_by_ordinal else None
+                name = None
+                if not import_by_ordinal:
+                    hint_name_offset = rva_to_offset(thunk_data)
+                    if hint_name_offset is not None and hint_name_offset + 2 < len(blob):
+                        hint = struct.unpack_from("<H", blob, hint_name_offset)[0]
+                        name = read_c_string(blob, hint_name_offset + 2)
+                        ordinal = hint
+                imports_local.append({
+                    "name": name,
+                    "ordinal": ordinal,
+                    "import_by_ordinal": import_by_ordinal,
+                })
+        descriptors.append({
+            "dll": dll_name,
+            "imports": imports_local,
+        })
+    return descriptors
+
+def compute_imphash(descriptors):
+    if not descriptors:
+        return None
+    sequence = []
+    for descriptor in descriptors:
+        dll = (descriptor.get("dll") or "").lower()
+        for imp in descriptor.get("imports", []):
+            if imp.get("name"):
+                sequence.append(f"{dll}.{imp['name'].lower()}")
+            elif imp.get("ordinal") is not None:
+                sequence.append(f"{dll}.ord{imp['ordinal']}")
+    if not sequence:
+        return None
+    joined = ",".join(sequence)
+    return hashlib.md5(joined.encode("utf-8", errors="ignore")).hexdigest()
+
+def parse_tls_callbacks(blob: bytes):
+    tls_dir = next((entry for entry in pe_metadata.get("data_directories", []) if entry.get("name") == "tls_table"), None)
+    if not tls_dir or not tls_dir.get("rva"):
+        return {}
+    tls_offset = rva_to_offset(tls_dir["rva"])
+    if tls_offset is None:
+        return {}
+    pointer_size = pe_context.get("pointer_size", 4)
+    image_base = pe_metadata.get("image_base") or 0
+    if pointer_size == 8:
+        fmt = "<QQQQII"
+    else:
+        fmt = "<IIIIII"
+    size_needed = struct.calcsize(fmt)
+    if tls_offset + size_needed > len(blob):
+        return {}
+    fields = struct.unpack_from(fmt, blob, tls_offset)
+    address_of_callbacks = fields[3]
+    callbacks = []
+    if address_of_callbacks:
+        callbacks_rva = int(address_of_callbacks - image_base)
+        cb_offset = rva_to_offset(callbacks_rva)
+        if cb_offset is not None:
+            fmt_ptr = "<Q" if pointer_size == 8 else "<I"
+            size_ptr = struct.calcsize(fmt_ptr)
+            while cb_offset + size_ptr <= len(blob):
+                callback_va = struct.unpack_from(fmt_ptr, blob, cb_offset)[0]
+                cb_offset += size_ptr
+                if callback_va == 0:
+                    break
+                callbacks.append(hex(callback_va))
+    return {
+        "present": True,
+        "callbacks": callbacks,
+        "callback_count": len(callbacks),
+    }
+
+def extract_rich_header(blob: bytes):
+    try:
+        pe_offset = struct.unpack_from("<I", blob, 0x3C)[0]
+    except struct.error:
+        return {"present": False}
+    rich_offset = blob.find(b"Rich", 0x80, pe_offset)
+    if rich_offset == -1 or rich_offset + 8 > len(blob):
+        return {"present": False}
+    key = struct.unpack_from("<I", blob, rich_offset + 4)[0]
+    cursor = rich_offset - 4
+    start = None
+    while cursor >= 0:
+        value = struct.unpack_from("<I", blob, cursor)[0]
+        if value ^ key == 0x536E6144:  # 'DanS'
+            start = cursor
+            break
+        cursor -= 4
+    if start is None:
+        return {"present": False}
+    decoded_entries = []
+    decoded_bytes = bytearray()
+    for entry_offset in range(start + 8, rich_offset, 4):
+        raw_value = struct.unpack_from("<I", blob, entry_offset)[0]
+        decoded = raw_value ^ key
+        decoded_bytes.extend(struct.pack("<I", decoded))
+        product_id = (decoded >> 16) & 0xFFFF
+        build_id = decoded & 0xFFFF
+        decoded_entries.append({
+            "product_id": product_id,
+            "build_id": build_id,
+        })
+    rich_hash = hashlib.sha256(decoded_bytes).hexdigest()
+    return {
+        "present": True,
+        "hash": rich_hash,
+        "entries": decoded_entries,
+    }
+
+import_descriptors = parse_import_descriptors(file_bytes)
+imphash = compute_imphash(import_descriptors)
+tls_info = parse_tls_callbacks(file_bytes)
+rich_info = extract_rich_header(file_bytes)
+
+analysis["advanced_imports"] = import_descriptors
+hashes_section = analysis.setdefault("hashes", {})
+if imphash:
+    hashes_section["imphash"] = imphash
+analysis["rich_header"] = rich_info
+if tls_info:
+    analysis["tls"] = tls_info
+if rich_info.get("hash"):
+    hashes_section["richhash"] = rich_info.get("hash")
 
 imports = analysis["rizin"].get("imports") or []
 exports = analysis["rizin"].get("exports") or []
@@ -520,12 +764,25 @@ packed_sections = [
     if isinstance(section.get("entropy"), (int, float)) and section["entropy"] >= 7.2
 ]
 
+data_directory_anomalies = []
+for entry in pe_metadata.get("data_directories", []) or []:
+    rva = entry.get("rva") or 0
+    size_entry = entry.get("size") or 0
+    if (rva == 0 and size_entry != 0) or (rva != 0 and size_entry == 0):
+        data_directory_anomalies.append({"name": entry.get("name"), "rva": rva, "size": size_entry})
+
+if data_directory_anomalies:
+    analysis.setdefault("anomalies", {})["data_directories"] = data_directory_anomalies
+
 heuristics = {
     "score": 0,
     "threshold": threshold,
     "reasons": [],
     "flags": {
         "packed_sections": [section.get("name") for section in packed_sections],
+        "data_directory_anomalies": [entry.get("name") for entry in data_directory_anomalies],
+        "tls_callbacks": analysis.get("tls", {}).get("callbacks", []),
+        "missing_import_table": not bool(import_descriptors),
     },
     "suspicious_imports": suspect_imports,
 }
@@ -568,6 +825,15 @@ if pe_metadata.get("entry_point_section"):
     entry_section = sections_by_name.get(pe_metadata["entry_point_section"])
     if entry_section and not entry_section.get("executable"):
         add_reason("Entry point located in non-executable section", 10)
+
+if analysis.get("tls", {}).get("callback_count", 0) > 0:
+    add_reason("TLS callbacks present", 15)
+
+if pe_metadata.get("is_pe") and not import_descriptors:
+    add_reason("Import table missing or empty", 20)
+
+if data_directory_anomalies:
+    add_reason("Inconsistent PE data directory entries", 10)
 
 heuristics["score"] = min(100, heuristics["score"])
 heuristics["suggested_suspect"] = heuristics["score"] >= threshold
@@ -649,6 +915,13 @@ if command -v "${RIZIN_CMD}" >/dev/null 2>&1; then
   fi
 else
   log "Rizin not found in PATH"
+fi
+
+if [[ -n "${ssdeep_hash}" && -f "${static_metadata_file}" ]]; then
+  if updated_metadata=$(jq --arg hash "${ssdeep_hash}" '.hashes = (.hashes // {}) | .hashes.ssdeep = $hash' "${static_metadata_file}" 2>/dev/null); then
+    static_metadata="${updated_metadata}"
+    printf '%s' "${static_metadata}" > "${static_metadata_file}"
+  fi
 fi
 
 yara_matches=()

@@ -88,6 +88,30 @@ You can run the bootstrap script directly or invoke it through `./deploy_test_en
    Output is saved as `samples/test-safe.exe.triage.json`. Review the JSON to
    confirm hashes, entropy, YARA matches, and heuristics (`suspected`).
 
+### Static inspection depth
+
+`triage.sh` bakes in the heuristics normally provided by Manalyze and extends
+them further:
+
+* **Import table reconstruction + imphash** – the parser walks the PE import
+  descriptors directly, preserves descriptor order, and emits both a structured
+  view (`static_analysis.advanced_imports`) and the derived imphash for rapid
+  clustering.
+* **Rich header decoding** – the DOS stub is decoded, the `Rich` signature is
+  hashed (SHA-256), and product/build tuples are preserved to help attribute the
+  originating toolchain.
+* **TLS callback detection** – TLS directory parsing highlights callback VAs and
+  raises a heuristic flag because malware frequently abuses TLS callbacks to run
+  before `main`/`DllMain`.
+* **Data-directory sanity checks** – inconsistent RVA/size entries are recorded
+  and wired into the suspicion score to catch malformed PE headers.
+* **ssdeep / fuzzy hashes** – if the `ssdeep` binary is present, the fuzzy hash
+  is injected into `static_analysis.hashes`. Install it via `apt install ssdeep`
+  (or the equivalent package on your distribution) to unlock this signal.
+
+These additions make the static JSON richer than the default Manalyze output
+while keeping the tooling self-contained inside the triage container.
+
 4. **Execute full dynamic analysis**
    ```bash
    ./orchestrator.sh --sample samples/test-safe.exe
