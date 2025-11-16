@@ -1,0 +1,4 @@
+# List of YARA rule identifiers considered noisy in this environment.
+# triage.sh appends matches to triage-noisy.log to ease tuning.
+# Example:
+# GENERIC_Dropper
