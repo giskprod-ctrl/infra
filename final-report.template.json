@@ -16,7 +16,15 @@
     "static_analysis": {
       "pe_metadata": {},
       "dll_analysis": {},
-      "indicators": { "urls": [], "ipv4": [], "registry": [] }
+      "indicators": { "urls": [], "ipv4": [], "registry": [] },
+      "string_stats": {
+        "total": 0,
+        "stored": 0,
+        "truncated": 0,
+        "limit": 200,
+        "overflow_artifact": "<optional path to sample.strings.json>",
+        "overflow_artifact_report_path": "<relative path within run dir when attached>"
+      }
     },
     "heuristics": { "score": <int>, "threshold": <int>, "reasons": [] },
     "suspicion_breakdown": []

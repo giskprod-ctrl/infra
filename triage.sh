@@ -13,6 +13,7 @@ WINEPREFIX="${WINEPREFIX:-$HOME/.wine-triage}"
 LOCAL_AV_CONFIG="${LOCAL_AV_CONFIG:-./local_av_scanners.json}"
 SUSPICION_THRESHOLD="${SUSPICION_THRESHOLD:-50}"
 MAX_DLL_EXPORTS="${MAX_DLL_EXPORTS:-5}"
+STATIC_STRINGS_LIMIT="${STATIC_STRINGS_LIMIT:-200}"
 
 print_usage() {
   cat <<'USAGE'
@@ -204,8 +205,9 @@ collect_static_metadata() {
   local out_file="$3"
   local max_exports="$4"
   local threshold="$5"
-  python3 - "$sample_path" "$rizin_bin" "$out_file" "$max_exports" "$threshold" <<'PY'
-import hashlib
+  local strings_limit="$6"
+  local strings_dir="$7"
+  python3 - "$sample_path" "$rizin_bin" "$out_file" "$max_exports" "$threshold" "$strings_limit" "$strings_dir" <<'PY'
 import json
 import math
 import re
@@ -220,6 +222,8 @@ rizin_bin = sys.argv[2]
 out_path = Path(sys.argv[3])
 max_exports = int(sys.argv[4])
 threshold = float(sys.argv[5])
+strings_limit = int(sys.argv[6])
+strings_dir = Path(sys.argv[7])
 
 analysis = {
     "rizin": {},
@@ -676,13 +680,28 @@ if rich_info.get("hash"):
 
 imports = analysis["rizin"].get("imports") or []
 exports = analysis["rizin"].get("exports") or []
-strings = analysis["rizin"].get("strings") or []
+strings_raw = analysis["rizin"].get("strings")
+if isinstance(strings_raw, dict) and "strings" in strings_raw:
+    strings_list = strings_raw.get("strings") or []
+elif isinstance(strings_raw, list):
+    strings_list = strings_raw
+else:
+    strings_list = []
 sections_rizin = analysis["rizin"].get("sections") or []
 
 if isinstance(imports, dict) and "imports" in imports:
     imports = imports.get("imports")
 if isinstance(exports, dict) and "exports" in exports:
     exports = exports.get("exports")
+
+def extract_string_text(entry):
+    if isinstance(entry, dict):
+        value = entry.get("string") or entry.get("value") or ""
+    else:
+        value = str(entry)
+    if not isinstance(value, str):
+        value = str(value)
+    return value
 
 dependency_modules = []
 suspect_imports = []
@@ -725,12 +744,9 @@ pe_metadata["dependency_modules"] = sorted({mod for mod in dependency_modules if
 pe_metadata["suspect_imports"] = suspect_imports
 
 extracted_strings = []
-if isinstance(strings, list):
-    for entry in strings:
-        if isinstance(entry, dict):
-            value = entry.get("string")
-        else:
-            value = str(entry)
+if isinstance(strings_list, list):
+    for entry in strings_list:
+        value = extract_string_text(entry)
         if value:
             extracted_strings.append(value)
 
@@ -738,6 +754,20 @@ url_pattern = re.compile(r"https?://[\w\.-/:?=&%]+", re.IGNORECASE)
 ipv4_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 registry_pattern = re.compile(r"HKEY_[A-Z_\\\\]+[\w\\\\/]+", re.IGNORECASE)
 email_pattern = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+def score_string(text: str) -> int:
+    score = len(text)
+    if url_pattern.search(text):
+        score += 150
+    if ipv4_pattern.search(text):
+        score += 75
+    if registry_pattern.search(text):
+        score += 90
+    if email_pattern.search(text):
+        score += 110
+    if any(ch in text for ch in ("\\", "%", ":")):
+        score += 5
+    return score
 
 indicators = {
     "urls": [],
@@ -757,6 +787,72 @@ for key in list(indicators.keys()):
     indicators[key] = unique[:100]
 
 analysis["indicators"] = indicators
+
+stored_strings = list(strings_list) if isinstance(strings_list, list) else []
+total_strings = len(stored_strings)
+truncated_count = 0
+overflow_artifact = None
+
+if strings_limit > 0 and total_strings > strings_limit and isinstance(strings_list, list):
+    scored_entries = []
+    for entry in strings_list:
+        text = extract_string_text(entry)
+        scored_entries.append((score_string(text), len(text), entry))
+    scored_entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    limited = []
+    for _, _, entry in scored_entries[:strings_limit]:
+        if isinstance(entry, dict):
+            limited.append(dict(entry))
+        else:
+            limited.append(entry)
+    stored_strings = limited
+    truncated_count = total_strings - len(stored_strings)
+    artifact_path = strings_dir / f"{sample.name}.strings.json"
+    try:
+        strings_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text(json.dumps(strings_list, indent=2))
+        overflow_artifact = str(artifact_path)
+    except Exception as exc:
+        analysis.setdefault("errors", []).append(f"strings_artifact_error:{exc}")
+elif strings_limit == 0 and isinstance(strings_list, list):
+    stored_strings = []
+    truncated_count = total_strings
+    artifact_path = strings_dir / f"{sample.name}.strings.json"
+    try:
+        strings_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text(json.dumps(strings_list, indent=2))
+        overflow_artifact = str(artifact_path)
+    except Exception as exc:
+        analysis.setdefault("errors", []).append(f"strings_artifact_error:{exc}")
+else:
+    artifact_path = strings_dir / f"{sample.name}.strings.json"
+    remove_existing = False
+    if strings_limit > 0:
+        remove_existing = total_strings <= strings_limit
+    else:
+        remove_existing = True
+    if remove_existing and artifact_path.exists():
+        try:
+            artifact_path.unlink()
+        except Exception:
+            pass
+
+if isinstance(strings_raw, dict):
+    limited_payload = dict(strings_raw)
+    limited_payload["strings"] = stored_strings
+    if "count" in limited_payload:
+        limited_payload["count"] = total_strings
+    analysis["rizin"]["strings"] = limited_payload
+else:
+    analysis["rizin"]["strings"] = stored_strings
+analysis["string_stats"] = {
+    "total": total_strings,
+    "stored": len(stored_strings),
+    "truncated": truncated_count,
+    "limit": strings_limit if strings_limit >= 0 else None,
+}
+if overflow_artifact:
+    analysis["string_stats"]["overflow_artifact"] = overflow_artifact
 
 packed_sections = [
     section
@@ -906,7 +1002,7 @@ static_metadata='{}'
 heuristics_suspect="false"
 heuristics_score="0"
 if command -v "${RIZIN_CMD}" >/dev/null 2>&1; then
-  if collect_static_metadata "${SAMPLE_ABS}" "${RIZIN_CMD}" "${static_metadata_file}" "${MAX_DLL_EXPORTS}" "${SUSPICION_THRESHOLD}"; then
+  if collect_static_metadata "${SAMPLE_ABS}" "${RIZIN_CMD}" "${static_metadata_file}" "${MAX_DLL_EXPORTS}" "${SUSPICION_THRESHOLD}" "${STATIC_STRINGS_LIMIT}" "$(dirname "${OUTPUT_JSON}")"; then
     static_metadata="$(<"${static_metadata_file}")"
     heuristics_suspect="$(jq -r '(.heuristics.suggested_suspect // false) | tostring' "${static_metadata_file}" 2>/dev/null || echo false)"
     heuristics_score="$(jq -r '(.heuristics.score // 0) | tostring' "${static_metadata_file}" 2>/dev/null || echo 0)"
