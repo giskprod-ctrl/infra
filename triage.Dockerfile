@@ -8,8 +8,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         wget curl unzip python3 python3-pip jq file \
         yara wine64 cabextract xvfb \
-        rizin \
     && rm -rf /var/lib/apt/lists/*
+
+# Install rizin static build (Ubuntu repositories may not provide a recent `rizin` package)
+ARG RIZIN_VERSION="v0.8.2"
+ARG RIZIN_SHA256="39299d492a43458900233e3036058b653d7554a6786192397fd4464c51fce5d6"
+RUN set -eux; \
+    curl -fsSL -o /tmp/rizin-static.tar.xz "https://github.com/rizinorg/rizin/releases/download/${RIZIN_VERSION}/rizin-${RIZIN_VERSION}-static-x86_64.tar.xz"; \
+    echo "${RIZIN_SHA256}  /tmp/rizin-static.tar.xz" | sha256sum --check -; \
+    tar -xf /tmp/rizin-static.tar.xz -C /tmp; \
+    install -m 0755 /tmp/bin/rizin /usr/local/bin/rizin; \
+    install -m 0755 /tmp/bin/rz-bin /usr/local/bin/rz-bin; \
+    rm -rf /tmp/rizin-static.tar.xz /tmp/bin
 
 # Install pe-sieve (latest stable)
 ARG PESIEVE_VERSION="v0.3.5"
