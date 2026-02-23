@@ -6,7 +6,7 @@ SAMPLE_DIR="${SAMPLE_DIR:-./samples}"
 OUTPUT_DIR="${TRIAGE_OUTPUT_DIR:-$SAMPLE_DIR}"
 YARA_RULE_DIR="${YARA_RULE_DIR:-./yara_rules}"
 TIMEOUT_SECONDS="${TRIAGE_TIMEOUT_SECONDS:-30}"
-PESIEVE_BIN="${PESIEVE_BIN:-/opt/pesieve/pe-sieve64.exe}"
+PESIEVE_BIN="${PESIEVE_BIN:-/opt/pesieve/pe-sieve.exe}"
 RIZIN_CMD="${RIZIN_CMD:-rizin}"
 FORCE_NONROOT="${FORCE_NONROOT:-1}"
 WINEPREFIX="${WINEPREFIX:-$HOME/.wine-triage}"
@@ -190,12 +190,23 @@ fi
 
 run_wine() {
   local cmd="$1"; shift
+  local -a wine_cmd=()
   if command -v wine64 >/dev/null 2>&1; then
-    WINEPREFIX="${WINEPREFIX}" wine64 "$cmd" "$@"
+    wine_cmd=(wine64 "$cmd" "$@")
+  elif [[ -x "/usr/lib/wine/wine64" ]]; then
+    wine_cmd=(/usr/lib/wine/wine64 "$cmd" "$@")
   elif command -v wine >/dev/null 2>&1; then
-    WINEPREFIX="${WINEPREFIX}" wine "$cmd" "$@"
+    wine_cmd=(wine "$cmd" "$@")
+  elif [[ -x "/usr/lib/wine/wine" ]]; then
+    wine_cmd=(/usr/lib/wine/wine "$cmd" "$@")
   else
     return 127
+  fi
+
+  if [[ -z "${DISPLAY:-}" ]] && command -v xvfb-run >/dev/null 2>&1; then
+    WINEPREFIX="${WINEPREFIX}" xvfb-run -a "${wine_cmd[@]}"
+  else
+    WINEPREFIX="${WINEPREFIX}" "${wine_cmd[@]}"
   fi
 }
 
@@ -205,11 +216,10 @@ collect_static_metadata() {
   local out_file="$3"
   local max_exports="$4"
   local threshold="$5"
-  python3 - "$sample_path" "$rizin_bin" "$out_file" "$max_exports" "$threshold" <<'PY'
-import hashlib
   local strings_limit="$6"
   local strings_dir="$7"
   python3 - "$sample_path" "$rizin_bin" "$out_file" "$max_exports" "$threshold" "$strings_limit" "$strings_dir" <<'PY'
+import hashlib
 import json
 import math
 import re
@@ -1084,7 +1094,7 @@ pesieve_dir="${TMPDIR}/pesieve"
 mkdir -p "${pesieve_dir}"
 if [[ -f "${PESIEVE_BIN}" ]]; then
   log "Running PE-sieve on sample"
-  if run_wine "${PESIEVE_BIN}" /log /o "${pesieve_dir}" /shellc /pid 0 /quiet /dir "$(dirname "${SAMPLE_ABS}")" /proc "${SAMPLE_NAME}" >/"${TMPDIR}/pesieve.log" 2>&1; then
+  if run_wine "${PESIEVE_BIN}" /dir "${pesieve_dir}" /pid 0 /shellc 3 /quiet >"${TMPDIR}/pesieve.log" 2>&1; then
     pesieve_status="completed"
     pesieve_stdout="$(cat "${TMPDIR}/pesieve.log" | tail -n 50)"
   else
@@ -1257,8 +1267,10 @@ if command -v yara >/dev/null 2>&1 && [[ ${#UNIQUE_YARA_INDEXES[@]} -gt 0 ]]; th
     fi
 
     err_file="${TMPDIR}/yara-${RANDOM}.err"
+    index_dir="$(dirname "${index_path}")"
+    index_file="$(basename "${index_path}")"
     set +e
-    yara_stdout="$(yara --fail-on-warnings -w -g -m "${index_path}" "${SAMPLE_ABS}" 2>"${err_file}")"
+    yara_stdout="$(cd "${index_dir}" && yara --fail-on-warnings -w -g -m "${index_file}" "${SAMPLE_ABS}" 2>"${err_file}")"
     yara_rc=$?
     set -e
 
@@ -1419,7 +1431,7 @@ if [[ "${av_results_json}" != '[]' ]]; then
 fi
 
 suspected=false
-declare -a suspicion_reasons
+suspicion_reasons=()
 
 if [[ "${heuristics_suspect}" == "true" ]]; then
   suspected=true

@@ -54,6 +54,89 @@ Options:
 
 You can run the bootstrap script directly or invoke it through `./deploy_test_env.sh` with `--bootstrap-install`/`--bootstrap-reset` when combining host validation with provisioning.
 
+
+### Automated Windows base VM provisioning
+
+To bootstrap a Windows base VM from an Internet ISO URL, you can use:
+
+```bash
+./scripts/provision_windows_base_vm.sh \
+  --iso-url "https://<your-trusted-source>/windows.iso" \
+  --iso-path ./isos/windows11.iso \
+  --vm-name windows10-base-installer \
+  --disk-path /var/lib/libvirt/images/windows10-base.qcow2 \
+  --bridge br-sandbox
+```
+
+The helper creates the QCOW2 image and defines/starts a libvirt VM with sane defaults
+(UEFI + q35 + virtio networking). You then finish the Windows installation and guest
+hardening steps (`qemu-guest-agent`, WinRM, `autorun.ps1`) before running
+`orchestrator.sh`.
+
+### One-command qualification workflow (static + dynamic + decision report)
+
+Use this helper to run triage, attempt full Windows dynamic analysis when
+prerequisites are available, and generate a decision-oriented report package:
+
+```bash
+./scripts/run_software_qualification.sh --sample samples/<software>.exe
+
+# For constrained hosts (no /dev/kvm bridge), allow software emulation and libvirt default network
+./scripts/run_software_qualification.sh --sample samples/<software>.exe --dynamic on --allow-emulation --net-mode default
+# (requires libvirt default network active: `virsh -c qemu:///system net-start default`)
+```
+
+Outputs are written under `out/qualification-<timestamp>/`:
+
+* `triage.json` – static + rapid dynamic triage output.
+* `final-report.json` – full orchestrator output (present when dynamic VM run succeeded).
+* `qualification-summary.json` – normalized decision payload (static findings, Windows changes, telemetry pointers).
+* `qualification-report.md` – human-readable report for acceptance review.
+
+If the environment does not have libvirt/KVM + Windows base image configured,
+static analysis still runs and the report explicitly marks dynamic as skipped.
+
+
+`qualification-summary.json` now also contains `dynamic_minimum_coverage`, a checklist
+that maps minimum dynamic-analysis expectations (installation impact, runtime
+network/files/registry/process coverage, use-case execution evidence) to report
+fields. This makes it explicit whether your requested questionnaire can be
+answered from the collected data or not.
+
+Quick infra-only readiness check (without running a sample):
+
+```bash
+./scripts/run_software_qualification.sh --self-check-only --auto-fix
+```
+
+This generates `infra-readiness.json` in the report directory with dependency and
+base-image status (`docker`, `virsh`, `virsh_system`, `qemu-img`, `smbclient`,
+`kvm`, bridge, and `BASE_IMAGE_PATH`).
+
+
+## Similar solutions and gap-closing roadmap
+
+To close the remaining gaps and answer an enterprise acceptance questionnaire end-to-end,
+this project should align with patterns used by mature sandboxes:
+
+* **CAPE / Cuckoo lineage**: multi-stage behavioral collection, signatures, and IOC normalization.
+* **Falcon Sandbox / Any.Run style reports**: timeline, ATT&CK mapping, and per-artifact drill-down.
+* **Procmon + Sysmon + ETW stack**: high-fidelity process/file/registry/network telemetry on Windows hosts.
+
+Practical roadmap implemented in this repository:
+
+1. Keep **VM-first dynamic analysis** (no Wine-only conclusions for final acceptance).
+2. Enforce host readiness gates (`kvm`, `virsh_system`, bridge, base image).
+3. Emit machine-readable **coverage status** (`dynamic_minimum_coverage`).
+4. Auto-generate a human questionnaire report (`dynamic-questionnaire.md`) from collected artifacts.
+
+What still needs to be completed on a fully capable host for 100% coverage:
+
+* Extend `autorun.ps1` with explicit install/runtime context fields (rights, prerequisites, license prompts).
+* Add deterministic network extraction (domains, protocols, cert validation outcomes per use-case).
+* Add Windows Defender + optional multi-engine scan summaries for created folders and binaries.
+* Add explicit per-use-case execution matrix (case name, trigger, observed deltas, conclusion).
+
 ## Quick Start
 
 1. **Bootstrap or reset the host**
