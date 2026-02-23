@@ -4,6 +4,7 @@ set -euo pipefail
 # ================= Configurable parameters =================
 BASE_IMAGE_PATH="${BASE_IMAGE_PATH:-/var/lib/libvirt/images/windows10-base.qcow2}"
 BRIDGE_NAME="${BRIDGE_NAME:-br-sandbox}"
+SANDBOX_NET_MODE="${SANDBOX_NET_MODE:-auto}"
 SAMPLE_DIR="${SAMPLE_DIR:-./samples}"
 OUTPUT_DIR="${OUTPUT_DIR:-./out}"
 VM_MEM="${VM_MEM:-4096}"
@@ -147,6 +148,23 @@ die() {
   RUN_STATUS="error"
   err "$*"
   exit 1
+}
+
+validate_base_image() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    return 0
+  fi
+  if ! command -v virt-filesystems >/dev/null 2>&1; then
+    log "virt-filesystems not available; skipping base image filesystem validation"
+    return 0
+  fi
+  local fs_out
+  if ! fs_out=$(virt-filesystems -a "${BASE_IMAGE_PATH}" --all --long 2>/dev/null); then
+    die "Base image ${BASE_IMAGE_PATH} is not inspectable by libguestfs. Ensure it is a prepared Windows image (not an empty qcow2)."
+  fi
+  if ! grep -qiE 'ntfs|vfat' <<<"${fs_out}"; then
+    die "Base image ${BASE_IMAGE_PATH} does not expose Windows-like filesystems (ntfs/vfat). Provide a prepared Windows base image."
+  fi
 }
 
 require_cmd() {
@@ -488,6 +506,8 @@ else
   HEURISTICS_SCORE=0
 fi
 
+validate_base_image
+
 log "Creating clone ${CLONE_PATH}"
 run_cmd qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE_PATH}" "${CLONE_PATH}"
 debug_event "clone" "qcow clone created" "$(jq -nc --arg clone "${CLONE_PATH}" '{clone:$clone}')"
@@ -501,7 +521,40 @@ log "Copying autorun script"
 run_cmd virt-copy-in -a "${CLONE_PATH}" autorun.ps1 "C:\\autorun"
 debug_event "inject" "autorun staged" "$(jq -nc --arg path 'C:/autorun/autorun.ps1' '{autorun:$path}')"
 
+validate_network_mode() {
+  local net_arg
+  net_arg="$(resolve_network_arg)"
+  if [[ "${net_arg}" == bridge=* ]]; then
+    local iface="${net_arg#bridge=}"
+    iface="${iface%%,*}"
+    ip link show "${iface}" >/dev/null 2>&1 || die "Required bridge interface ${iface} is not available."
+  else
+    local active
+    active="$(virsh --connect "${QEMU_URI}" net-info default 2>/dev/null | awk -F': *' '/^Active:/ {print $2}' | tr '[:upper:]' '[:lower:]')"
+    [[ "${active}" == "yes" ]] || die "Libvirt default network is not active (needed for SANDBOX_NET_MODE=${SANDBOX_NET_MODE})."
+  fi
+}
+
+resolve_network_arg() {
+  local mode="${SANDBOX_NET_MODE}"
+  if [[ "${mode}" == "bridge" ]]; then
+    echo "bridge=${BRIDGE_NAME},model=virtio"
+    return 0
+  fi
+  if [[ "${mode}" == "default" ]]; then
+    echo "network=default,model=virtio"
+    return 0
+  fi
+  if ip link show "${BRIDGE_NAME}" >/dev/null 2>&1; then
+    echo "bridge=${BRIDGE_NAME},model=virtio"
+  else
+    echo "network=default,model=virtio"
+  fi
+}
+
 start_vm() {
+  local net_arg
+  net_arg="$(resolve_network_arg)"
   local -a cmd=(
     virt-install
     --name "${VM_NAME}"
@@ -509,7 +562,7 @@ start_vm() {
     --vcpus "${VM_CPUS}"
     --import
     --disk "path=${CLONE_PATH},format=qcow2"
-    --network "bridge=${BRIDGE_NAME},model=virtio"
+    --network "${net_arg}"
     --os-variant win10
     --graphics none
     --noautoconsole
@@ -540,6 +593,7 @@ wait_for_ip() {
 }
 
 log "Starting VM ${VM_NAME}"
+validate_network_mode
 start_vm
 debug_event "vm" "vm start requested" "$(jq -nc --arg vm "${VM_NAME}" '{vm:$vm}')"
 update_runtime_state "vm" "starting" "$(jq -nc --arg vm "${VM_NAME}" '{vm:$vm}')"
@@ -552,7 +606,17 @@ update_runtime_state "vm" "ip-acquired" "$(jq -nc --arg ip "${GUEST_IP}" '{guest
 
 start_tcpdump() {
   local pcap_prefix="${RUN_DIR}/${RUN_ID}"
-  local -a tcpdump_args=(-i "${BRIDGE_NAME}" -w "${pcap_prefix}-%Y%m%d%H%M%S.pcap" -C "${TCPDUMP_ROTATE_SIZE_MB}" -W "${TCPDUMP_FILES}" -n)
+  local iface="${BRIDGE_NAME}"
+  local net_arg
+  net_arg="$(resolve_network_arg)"
+  if [[ "${net_arg}" != bridge=* ]]; then
+    log "Skipping tcpdump: SANDBOX_NET_MODE=${SANDBOX_NET_MODE} resolved to non-bridge network (${net_arg})"
+    debug_event "tcpdump" "skipped" "$(jq -nc --arg mode "${SANDBOX_NET_MODE}" --arg net "${net_arg}" '{mode:$mode,network:$net}')"
+    return 0
+  fi
+  iface="${net_arg#bridge=}"
+  iface="${iface%%,*}"
+  local -a tcpdump_args=(-i "${iface}" -w "${pcap_prefix}-%Y%m%d%H%M%S.pcap" -C "${TCPDUMP_ROTATE_SIZE_MB}" -W "${TCPDUMP_FILES}" -n)
   local -a wrapper=()
   if [[ -n "${TCPDUMP_PRIV_CMD}" ]]; then
     # shellcheck disable=SC2206
@@ -581,7 +645,7 @@ start_tcpdump() {
   TCPDUMP_PID=$!
   record_command "${start_ts}" "${start_ts}" 0 "${cmd_str}" "background-start"
   log "tcpdump PID ${TCPDUMP_PID}"
-  debug_event "tcpdump" "packet capture started" "$(jq -nc --arg pid "${TCPDUMP_PID}" --arg iface "${BRIDGE_NAME}" '{pid:$pid,interface:$iface}')"
+  debug_event "tcpdump" "packet capture started" "$(jq -nc --arg pid "${TCPDUMP_PID}" --arg iface "${iface}" '{pid:$pid,interface:$iface}')"
   update_runtime_state "tcpdump" "running" "$(jq -nc --arg pid "${TCPDUMP_PID}" '{pid:$pid}')"
 }
 
